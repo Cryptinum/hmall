@@ -1,4 +1,4 @@
-package com.hmall.trade.domain.query;
+package com.hmall.item.domain.query;
 
 import com.hmall.common.domain.PageQuery;
 import io.swagger.annotations.ApiModel;

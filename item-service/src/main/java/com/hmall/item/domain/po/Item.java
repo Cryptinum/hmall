@@ -1,4 +1,4 @@
-package com.hmall.trade.domain.po;
+package com.hmall.item.domain.po;
 
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableField;
@@ -22,7 +22,7 @@ import java.time.LocalDateTime;
 @Data
 @EqualsAndHashCode(callSuper = false)
 @Accessors(chain = true)
-@TableName("trade")
+@TableName("item")
 public class Item implements Serializable {
 
     private static final long serialVersionUID = 1L;

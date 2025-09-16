@@ -1,13 +1,13 @@
-package com.hmall.trade.service.impl;
+package com.hmall.item.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmall.common.exception.BizIllegalException;
 import com.hmall.common.utils.BeanUtils;
-import com.hmall.trade.domain.dto.ItemDTO;
-import com.hmall.trade.domain.dto.OrderDetailDTO;
-import com.hmall.trade.domain.po.Item;
-import com.hmall.trade.mapper.ItemMapper;
-import com.hmall.trade.service.IItemService;
+import com.hmall.item.domain.dto.ItemDTO;
+import com.hmall.item.domain.dto.OrderDetailDTO;
+import com.hmall.item.domain.po.Item;
+import com.hmall.item.mapper.ItemMapper;
+import com.hmall.item.service.IItemService;
 import org.springframework.stereotype.Service;
 
 import java.util.Collection;
@@ -25,7 +25,7 @@ public class ItemServiceImpl extends ServiceImpl<ItemMapper, Item> implements II
 
     @Override
     public void deductStock(List<OrderDetailDTO> items) {
-        String sqlStatement = "com.hmall.trade.mapper.ItemMapper.updateStock";
+        String sqlStatement = "com.hmall.mapper.item.ItemMapper.updateStock";
         boolean r = false;
         try {
             r = executeBatch(items, (sqlSession, entity) -> sqlSession.update(sqlStatement, entity));
