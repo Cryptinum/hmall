@@ -1,0 +1,12 @@
+/hm-api.iml
+/logs/
+/.idea/
+**/target/
+.idea
+*.iml
+*.class
+*Test.java
+**/test/
+**/resources/*.yml
+**/resources/*.yaml
+**/resources/*.jks
