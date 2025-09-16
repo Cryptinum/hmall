@@ -522,3 +522,84 @@ public class DefaultFeignConfig {
 
 配置好之后，每次调用远程服务时，都会在控制台输出详细的日志信息，包括请求方法、URL、请求头、请求体、响应状态码、响应头、响应体等。
 
+# Day 4 - 微服务 中 - 网关与配置中心
+
+本节主要解决前端访问入口、统一权限校验与配置管理的问题。
+
+## 网关
+
+网关负责请求的路由、转发、鉴权等功能。常见的网关有Netflix Zuul（早期实现）、Spring Cloud Gateway（当前主流）等。
+
+Spring Cloud Gateway官网：https://spring.io/projects/spring-cloud-gateway
+
+## 统一前端访问入口
+
+将网关的端口设置为8080，并在网关内部配置路由规则（通过Nacos的注册中心列表拉取服务列表），将不同的请求路径转发和负载均衡到不同的微服务，这样就能实现统一前端的访问 入口。微服务的地址只需要暴露网关地址而无需暴露微服务本身的地址，前端只知道网关地址也可以将后端视为一个整体的单体架构，一定程度上保护了后端的服务，也提升了前端的开发和交互体验。
+
+### 基本配置
+
+首先引入commmon模块、Spring Cloud Gateway、Nacos和负载均衡器的依赖：
+
+```xml
+
+<dependencies>
+    <!--common-->
+    <dependency>
+        <groupId>com.heima</groupId>
+        <artifactId>hm-common</artifactId>
+        <version>1.0.0</version>
+    </dependency>
+    <!--网关-->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-gateway</artifactId>
+    </dependency>
+    <!--nacos discovery-->
+    <dependency>
+        <groupId>com.alibaba.cloud</groupId>
+        <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>
+    </dependency>
+    <!--负载均衡-->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+    </dependency>
+</dependencies>
+```
+
+然后创建启动类 `GatewayApplication`，并添加 `@SpringBootApplication` 注解。
+
+最后添加配置类，配置具体的路由规则：
+
+```yaml
+server:
+  port: 8080
+spring:
+  application:
+    name: gateway
+  cloud:
+    nacos:
+      server-addr: ${hm.nacos.host}:8848
+    gateway:
+      routes:
+        - id: item  # 路由规则id，自定义，唯一
+          uri: lb://item-service  # 路由的目标服务，lb代表负载均衡，会从注册中心拉取服务列表
+          predicates: # 路由断言，判断当前请求是否符合当前规则，符合则路由到目标服务
+            - Path=/items/**,/search/**  # 这里是以请求路径作为判断规则
+        - id: cart
+          uri: lb://cart-service
+          predicates:
+            - Path=/carts/**
+        - id: user
+          uri: lb://user-service
+          predicates:
+            - Path=/users/**,/addresses/**
+        - id: trade
+          uri: lb://trade-service
+          predicates:
+            - Path=/orders/**
+        - id: pay
+          uri: lb://pay-service
+          predicates:
+            - Path=/pay-orders/**
+```
