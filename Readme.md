@@ -603,3 +603,186 @@ spring:
           predicates:
             - Path=/pay-orders/**
 ```
+
+### 路由过滤
+
+`spring.cloud.gateway.routes` 下的每一个元素都表示一条路由规则，最终由 `RouteDefinition` 类进行读取，包含以下几个重要属性：
+
+- `id`：路由规则的唯一标识，可以自定义。
+- `uri`：路由的目标地址，可以是HTTP URL，也可以是服务名称（以 `lb://` 开头表示通过负载均衡访问）。
+- `predicates`：路由断言，用于判断请求是否符合当前路由规则。
+    - 常见的断言有 `Path`（请求路径）、`Method`（请求方法）、`Header`（请求头）等，共12种。
+- `filters`：路由过滤器，用于对请求和响应进行特殊处理。
+    - 常见的过滤器有 `AddRequestHeader` （添加请求头）、`AddResponseHeader`（添加响应头）、`RewritePath`（重写请求路径）等，共33种。
+
+上一部分的路由规则中，只使用了 `Path` 断言来判断请求路径是否符合当前路由规则。实际上，可以根据业务需求，添加更多的断言和过滤器来实现更复杂的路由逻辑。例如，可以添加Method断言来限制请求方法为GET或POST，添加 `Header` 断言来检查请求头中是否包含某个特定的值，添加过滤器来修改请求路径或添加请求头等。下面的路由规则中，添加了 `Method` 断言和 `AddRequestHeader` 过滤器：
+
+```yaml
+- id: item
+  uri: lb://item-service
+  predicates:
+    - Path=/items/**,/search/**
+    - Method=GET
+  filters:
+    - AddRequestHeader=X-Request-Source,Gateway
+```
+
+针对默认对所有请求生效的过滤器，可以通过与 `routes` 同级的 `default-filters` 选项进行配置。
+
+## 统一权限校验
+
+> 总结：在本节中，需要实现三个内容：
+> 1. 网关的登录校验并向微服务传递用户信息，见 `hm-gateway` 模块下的 `AuthGlobalFilter` 过滤器，它是一个 `GlobalFilter`
+> 2. 微服务拦截并校验用户信息，见 `hm-common` 模块下的 `UserInfoInterceptor` 拦截器，它是一个 `HandlerInterceptor`
+> 3. 微服务之间的相互调用传递用户信息，见 `hm-api` 模块下的 `DefaultFeignConfig` 配置类中的 `userInfoRequestInterceptor` 拦截器，它是一个 `RequestInterceptor`
+
+在拆分后的微服务架构中，登录功能被拆分到了用户服务中，由于这是首次颁发Session的JWT Token的服务，因此用户服务不需要进行登录校验，直接放在用户服务中是可接受的。
+
+而其他服务（如商品服务、购物车服务、订单服务等）都需要对Token进行登录校验，以确保用户身份的合法性和安全性。以前实现的校验逻辑是通过 `UserContext` 中的 `ThreadLocal` 变量来存储当前请求的用户信息。然而这个实现依赖于Tomcat客户端的线程一致性，当服务分散至各个微服务之后，每个服务都属于不同的Tomcat客户端和进程，无法共享 `ThreadLocal` 变量，因此每个服务都需要单独实现登录校验的逻辑。
+
+为了避免在每个服务中重复编写登录校验的代码，可以将登录校验逻辑集中到网关中进行处理，**需要先校验合法性，然后才转发**，将校验通过的用户信息向后传递给各个服务。
+
+在这个过程中，需要解决三个问题：
+
+1. 网关路由是通过配置文件进行的，具体处理的底层逻辑是什么？如何在转发之前做登录校验？
+2. 网关在校验JWT Token之后，如何将用户信息传递给后端的各个服务？
+3. 微服务之间的相互调用不经过网关，这种情况下如何传递用户信息？
+
+### 网关过滤器的底层逻辑
+
+网关的底层显然是没有业务逻辑的，其只需要根据配置文件中的路由规则进行判断和过滤，然后转发给对应的微服务，类似责任链模式。
+
+首先，对路由规则的判断通过 `HandlerMapping` 接口完成。这是一个路由映射器，默认实现是 `RoutePredicateHandlerMapping` 类。它会**读取配置文件中的路由断言进行规则匹配**，将匹配的路由规则存储进上下文，然后把请求交给 `WebHandler` 进行处理。
+
+`WebHandler` 的默认实现是 `FilteringWebHandler` 类。它会**读取配置文件中的路由过滤器**，找到当前请求对应路由生效的哪些过滤器，并将这些过滤器与默认过滤器合并，然后将这些过滤器放入集合并排序，组成一个**过滤器链**，最后依次执行这些过滤器。
+
+特别地，在这个过滤器链的最后，还有一个 `NettyRoutingFilter` （Netty路由过滤器）。这个过滤器的作用是将**请求转发给对应的微服务**。它会从上下文中获取路由规则，得到目标服务的地址，然后发送HTTP请求，将请求转发给目标服务，并将封装后的响应存回上下文，逐级返回给客户端。
+
+逐级意味着在微服务接收请求前和返回响应后，每个过滤器都被调用了两次，一次是请求前，一次是响应后。这是因为过滤器内部可以包含PRE和POST两部分逻辑。**只有上一个过滤器的PRE执行成功的情况下，才会调用下一个过滤器**，因此只有当所有过滤器的PRE逻辑都执行通过后，请求才会被路由到微服务，后续过滤器不再执行。另一方面，在微服务返回结果后，就会倒序执行过滤器的POST逻辑。这样就可以在请求前对请求进行修改（如添加请求头、重写路径等），在响应后对响应进行处理（如添加响应头、修改响应体等）。
+
+### 在网关中实现登录校验
+
+根据以上网关请求处理流程，不难发现，想要实现登录校验的功能，只需要**创建一个自定义的过滤器**，并将其添加到路由规则的过滤器链中即可。这个过滤器的**PRE逻辑**需要从请求头中获取JWT Token，然后进行解析和校验，如果校验通过，则**将用户信息存入请求头中**，并调用 `chain.filter(exchange)` 将请求传递给下一个过滤器；如果校验失败，则直接返回错误响应，阻止请求继续传递。
+
+#### 自定义过滤器
+
+网关过滤器有两种类型：
+
+- 路由过滤器 `GatewayFilter` ：只对某个路由规则生效，可以通过配置文件中的 `filters` 选项进行配置，默认不生效，**配置到路由后才生效**。
+- 全局过滤器 `GlobalFilter` ：对所有路由规则生效，可以通过实现 `GlobalFilter` 接口来创建，**类实现后自动生效**。
+
+两个类中都有一个 `Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain)` 方法，两个参数分别表示当前请求的**上下文**和**过滤器链**。`ServerWebExchange` 类中包含了过滤器链中的共享对象，如请求和响应对象，可以通过 `exchange.getRequest()` 获取请求对象，通过 `exchange.getResponse()` 获取响应对象。以下是一个继承 `GlobalFilter` 的示例：
+
+```java
+
+@Component
+public class MyGlobalFilter implements GlobalFilter, Ordered {
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        // 获取请求对象
+        ServerHttpRequest request = exchange.getRequest();
+        // 获取请求头
+        HttpHeaders headers = request.getHeaders();
+        System.out.println("headers = " + headers);
+        // 继续调用过滤器链中的下一个过滤器
+        return chain.filter(exchange);
+    }
+
+    @Override
+    public int getOrder() {
+        // 设置为最高优先级
+        return Ordered.HIGHEST_PRECEDENCE;
+    }
+}
+```
+
+路由过滤器 `GatewayFilter` 可以自由指定作用范围，以及自定义参数，但实现相对来说更复杂。自定义一个 `GatewayFilter` 不能直接实现接口，而是需要继承一个抽象工厂类 `AbstractGatewayFilterFactory` ，并指定一个配置类作为泛型参数。由于配置中过滤器可以添加自定义参数，因此对不同参数，过滤器的效果也是不同的，工厂类就实现了通过读取配置，并创建定制化的过滤器对象。实现时，需要在过滤器类中重写 `apply` 方法，返回一个 `GatewayFilter` 对象。在这个对象的 `filter` 方法中实现具体的过滤逻辑。以下是一个继承 `AbstractGatewayFilterFactory` 的示例：
+
+```java
+// 注意定义时类名需要以 "GatewayFilterFactory" 结尾，前缀则以后作为过滤器名称使用，即 "MyPrint"
+@Component
+public class MyPrintGatewayFilterFactory extends AbstractGatewayFilterFactory<Object> {
+    @Override
+    public GatewayFilter apply(Object config) {
+        return new GatewayFilter() {
+            @Override
+            public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+                System.out.println("经过了MyPrintGatewayFilter");
+                return chain.filter(exchange);
+            }
+        };
+    }
+}
+```
+
+#### 实现登录校验
+
+首先将公钥jks文件放入网关模块的 `resources` 目录下，将原始项目中的 `jwt` 选项复制到网关模块的 `application.yaml` 中。然后将原始项目中的JWT配置文件和工具类复制到网管模块的对应目录下。接着创建一个 `AuthGlobalFilter` 类，继承 `GlobalFilter`，并在 `apply` 方法中实现登录校验的逻辑，见 `AuthGlobalFilter` 类。
+
+1. 获取请求和响应： `exchange.getRequest()` 和 `exchange.getResponse()`。
+2. 判断放行路径：通过遍历 `authProperties.getExcludePaths()` 判断当前请求路径是否在放行列表中，如果是则直接调用 `chain.filter(exchange)` 放行。
+3. 获取请求头中的Token： `request.getHeaders().get("Authorization")`
+4. 校验Token：使用 `JwtUtils` 工具类进行解析和校验，如果校验失败，返回错误响应。
+5. 传递用户信息：如果校验通过，从Token中获取用户信息，并将其存入请求头中.
+6. 放行至下一个过滤器：如果全部通过，则调用 `chain.filter(exchange)` 继续传递请求。
+
+#### 传递用户信息
+
+在网关中校验通过后，需要将用户信息传递给后端的各个微服务。由于HTTP请求是无状态的，因此无法直接共享内存中的变量（如ThreadLocal）。一种常见的做法是将用户信息存储在请求头中，然后在后端服务中从请求头中获取用户信息。
+
+问题在于，即便已经实现了将用户信息传递至后端，得到用户信息的逻辑可能会在多个服务中重复出现，导致代码冗余和维护困难。为了解决这个问题，可以使用Spring MVC的拦截器进行实现。拦截器可以在请求到达控制器之前进行处理，适合用于统一的请求预处理逻辑，如登录校验、用户信息提取等。
+
+因此需要做两件事，首先在网关中将用户信息存入请求头，然后在各个微服务中创建一个拦截器，从请求头中提取用户信息，并存入 `UserContext` 的 `ThreadLocal` 变量中，供后续的业务逻辑使用。
+
+针对存入请求头，使用 `exchange.mutate()` 方法，创建一个新的请求对象，然后最终放行这个新的exchange：
+
+```java
+ServerWebExchange mutatedExchange = exchange.mutate()  // 下游请求修改
+        .request(builder -> builder.header("user-info", userId.toString()))
+        .build();  // 构建新的exchange
+```
+
+针对提取用户信息，在 `hm-common` 模块中创建一个 `UserInfoInterceptor` 类，实现 `HandlerInterceptor` 接口。由于登录拦截已经在网关中实现了，因此不需要再拦截一次，可以全部放行，只起到传递用户信息的作用。实现时需要重写 `preHandle` 方法，从请求头中获取用户信息，并存入 `UserContext` 的 `ThreadLocal` 变量中。
+
+编写完拦截器之后，还需要将拦截器注册到Spring MVC中。可以创建一个配置类 `MvcConfig`，实现 `WebMvcConfigurer` 接口，添加 `@Configuration` 注解，并重写 `addInterceptors` 方法，将拦截器添加到注册表中。
+
+注册完拦截器之后，由于拦截器是在 `hm-common` 模块中编写的，要想让各个微服务都能使用这个拦截器，还需要在 `META-INF/spring.factories` 文件中添加以下内容：
+
+```properties
+org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
+  com.hmall.common.config.MvcConfig
+```
+
+### 问题详解 - Spring Boot的条件化装配原理
+
+> 注意，由于网关模块的技术栈是Spring Cloud Gateway（基于Spring Webflux），其中是没有Spring MVC的，因此如果此时就启动服务，WebFlux因为找不到 `WebMvcConfigurer` 接口这种MVC的核心类，导致启动失败。可以在MVC配置类上添加 `@ConditionalOnClass(DispatcherServlet.class)` 注解，表示只有在类路径下存在 `DispatcherServlet` 类时，才加载该配置类。由于 `DispatcherServlet` 是Spring MVC的核心类，这样就能避免网关模块启动失败的问题。
+
+### 微服务之间传递用户信息
+
+随着微服务的数量逐渐增加，项目中的很多业务需要多个微服务共同合作完成，而这个过程中需要微服务之间互相传递用户信息。但是在微服务之间的相互调用中，通常不会经过网关，因此无法通过网关传递用户信息。对于使用 `ThreadLocal` 变量存储的思路，前文也提到过，这种方式无法跨进程共享内存，**原因有二**：
+
+1. 分布式系统中，每个微服务有不同的线程实例， `ThreadLocal` 线程私有
+2. 前文的实现中，用户信息 `User-Info` 请求头只能通过网关向微服务传递，微服务之间的相互调用无法传递
+
+为解决这个问题，OpenFeign提供了一个 `RequestInterceptor` 接口，可以在每次Feign客户端发送请求之前，对请求进行预处理，例如添加请求头、修改请求参数等。通过实现这个接口，可以在每次Feign客户端发送请求之前，从 `UserContext` 中获取用户信息，并将其添加到请求头中，从而实现微服务之间的用户信息传递。
+
+直接在 `hm-api` 模块的Feign配置类中编写，注册一个返回 `RequestInterceptor` 类型的Bean即可：
+
+```java
+
+@Bean
+public RequestInterceptor userInfoRequestInterceptor() {
+    return new RequestInterceptor() {
+        @Override
+        public void apply(RequestTemplate template) {
+            Long user = UserContext.getUser();
+            if (user == null) {
+                return;
+            }
+            template.header("User-Info", user.toString());
+        }
+    };
+}
+```
+
+> 注意，虽然此处没有添加任何加载Bean的注解，但是在各个微服务的启动类上，添加了 `@EnableFeignClients(basePackages = "com.hmall.api.client")` 注解，指定了Feign客户端接口所在的包路径。当使用Feign客户端发起调用时，Feign会创建一个 `RequestTemplate` 对象来准备请求，在请求发送之前，Feign会遍历所有已经注册的 `RequestInterceptor` 拦截器Bean，并调用它们的 `apply` 方法，对请求进行预处理。
