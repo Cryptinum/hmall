@@ -629,6 +629,8 @@ spring:
 
 针对默认对所有请求生效的过滤器，可以通过与 `routes` 同级的 `default-filters` 选项进行配置。
 
+更多原理见[动态路由](#动态路由)一节。
+
 ## 统一权限校验
 
 > 总结：在本节中，需要实现三个内容：
@@ -786,3 +788,95 @@ public RequestInterceptor userInfoRequestInterceptor() {
 ```
 
 > 注意，虽然此处没有添加任何加载Bean的注解，但是在各个微服务的启动类上，添加了 `@EnableFeignClients(basePackages = "com.hmall.api.client")` 注解，指定了Feign客户端接口所在的包路径。当使用Feign客户端发起调用时，Feign会创建一个 `RequestTemplate` 对象来准备请求，在请求发送之前，Feign会遍历所有已经注册的 `RequestInterceptor` 拦截器Bean，并调用它们的 `apply` 方法，对请求进行预处理。
+
+## 统一配置中心
+
+目前在微服务中有大量重复的配置，我们希望引入一个统一的配置中心，来集中管理和分发这些配置。常见的配置中心有Spring Cloud Config（早期实现）、Nacos（当前主流）等。通过统一的配置管理服务，可以实现配置的集中存储、版本控制、动态刷新等功能，无需重启即可更新配置，提升微服务的可维护性和灵活性。
+
+### 配置共享
+
+首先把共享的配置添加到Nacos中，包括JDBC、Mybatis Plus、日志、Swagger、OpenFeign等配置。然后编写一个配置类 `NacosConfig` 用于拉取共享配置代替微服务的本地配置。
+
+这样，在Spring Boot应用程序启动时，会先尝试拉取Nacos的配置，然后初始化对应的应用程序上下文，接着再加载本地的配置文件并初始化上下文。由于Spring Boot的配置加载是有优先级的，后加载的配置会覆盖先加载的配置，因此本地配置文件中的配置会覆盖Nacos中的共享配置，剩余的配置进行合并。
+
+但是这样的话，程序启动时并不知道Nacos的地址，如何拉取Nacos的配置？Nacos提供了一种机制，让程序在本地先读取一个 `bootstrap.yaml` 引导配置文件，这个文件会在应用程序启动的最早阶段被加载。可以在这个文件中配置Nacos的地址和命名空间等信息，这样程序就能在启动时连接到Nacos，并拉取共享配置。以购物车服务为例：
+
+```yaml
+spring:
+  application:
+    name: cart-service  # 微服务名称
+  profiles:
+    active: dev
+  cloud:
+    nacos:
+      server-addr: ${hm.nacos.host}:8848
+      config:
+        file-extension: yaml # 文件后缀名
+        shared-configs: # 共享配置
+          - data-id: shared-jdbc.yaml # 共享mybatis配置
+          - data-id: shared-log.yaml # 共享日志配置
+          - data-id: shared-swagger.yaml # 共享日志配置
+```
+
+### 配置热更新
+
+配置热更新指的是，当配置中心中的配置发生变化时，能够自动刷新应用程序中的配置，而**无需重启应用程序**。Nacos支持配置的动态刷新，可以通过监听配置的变化事件来实现热更新。例如用户登录的超时时长、登录失败的最大尝试次数、购买上限等等。
+
+首先引入依赖：
+
+```xml
+
+<dependencies>
+    <!--nacos配置管理-->
+    <dependency>
+        <groupId>com.alibaba.cloud</groupId>
+        <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
+    </dependency>
+    <!--读取bootstrap文件-->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-bootstrap</artifactId>
+    </dependency>
+</dependencies>
+```
+
+然后在Nacos中添加一个名称格式如下的配置：
+
+```
+{spring.application.name}-{spring.profiles.active}（可选）.{file.extension}
+```
+
+例如对于 `cart-service` 服务，在 `dev` 环境下，文件后缀名为 `yaml`，则配置的名称应为 `cart-service-dev.yaml`。然后在微服务中配置需要以特定方式读取需要热更新的配置属性，有两种方法：
+
+1. 在类上添加 `@ConfigurationProperties` 注解，配置参数 `prefix` 指定配置前缀
+2. 在字段上添加 `@Value` 注解，指定配置的完整路径，然后在类上添加 `@RefreshScope` 注解，指定需要热更新
+
+### 动态路由
+
+> 总结：创建一个配置类，为 `ConfigService` 注册一个监听器 `Listener`，当路由更新时则会自动调用回调函数，其中需要实现的逻辑有将Nacos的远程路由配置解析为 `RouteDefinition` 列表、删除旧的路由信息、添加新的路由信息。
+
+目前我们的网关路由规则是通过配置文件进行的，无法动态修改和更新。Nacos支持动态路由，要实现动态路由，首先要将路由配置保存到Nacos，当Nacos中的路由配置变更时，推送最新配置到网关，实时更新网关中的路由信息。问题在于**Nacos只能保存并推送配置**，而网关内部的路由更新，Nacos是无法进行帮助的。**因此我们自己需要实现的是：监听Nacos配置的变化事件，然后在事件中更新网关的路由信息。**
+
+Nacos提供了一系列SDK用于操作配置和服务注册发现，特别地，监听配置的写法可以参见[这个链接](https://nacos.io/docs/v2/guide/user/sdk/#%E8%AF%B7%E6%B1%82%E7%A4%BA%E4%BE%8B-1)。其中的 `getConfig` 方法就是从Nacos中获取配置，`addListener` 方法用于监听配置的变化事件。这两个方法可以合并成直接调用 `getConfigAndSignListener` 方法来完成。
+
+#### Nacos的自动配置
+
+Nacos的自动配置类是 `NacosConfigBootstrapConfiguration` 和 `NacosConfigAutoConfiguration`，它们会在Spring Boot应用程序启动时被加载。其中都注册了 `NacosConfigProperties` 和 `NacosConfigManager` 两个Bean。前者用于存储Nacos的配置信息，后者用于管理Nacos的配置操作。那么我们就可以通过注入这两个Bean，来获取Nacos的配置，并监听配置的变化事件。
+
+`NacosConfigManager` 的构造函数调用了该类的 `createConfigService` 方法（本质上是一个初始化方法），该方法会创建一个 `ConfigService` 对象，这个对象是通过调用 `NacosFactory.createConfigService` 方法来创建的，这与官方SDK中的创建方式一致。
+
+#### 实现动态路由
+
+引入Nacos配置管理和Bootstrap读取依赖，见[配置热更新](#配置热更新)一节引入的依赖。
+
+首先创建一个类用于动态路由读取，见 `hm-gateway` 模块下的 `DynamicRouteLoader` 类。该类中注入了 `NacosConfigManager` 和 `RouteDefinitionWriter` 两个Bean。前者用于获取Nacos的配置，后者用于更新网关的路由信息。
+
+`NacosConfigManager` 调用 `getConfigService().getConfigAndSignListener()` 方法，传入服务名称、命名空间、超时时间和监听器对象。其中监听器对象是一个 `Listener` 接口的实现类，可以是匿名内部类或自己实现的类。该接口中有两个方法，`receiveConfigInfo` 和 `getExecutor`。前者用于接收配置变化的通知，当Nacos中的配置发生变化时，该方法会被调用，并传入最新的配置内容。后者用于指定监听器的执行器，可以返回null，表示使用默认的执行器。
+
+在 `receiveConfigInfo` 方法中和调用 `getConfigAndSignListener` 后，都需要更新路由配置信息，分为三步：
+
+1. 将接收到的配置内容转换为 `List<RouteDefinition>` 对象（在[本节](#路由过滤)的yaml配置中，spring.cloud.gateway.routes配置的实际上就是这个），直接使用Hutool工具包的 `JSONUtil.toList` 方法进行转换。
+2. 删除旧的路由信息，调用 `RouteDefinitionWriter` 的 `delete` 方法，传入路由ID，循环遍历，需要在配置类中定义一个 `Set` 进行存储 `routeIds` 。
+3. 添加新的路由信息，调用 `RouteDefinitionWriter` 的 `save` 方法，传入新的路由定义对象，循环遍历，同时将新的 `routeDefinition.getId()` 保存到 `routeIds` 中。
+
+具体实现见 `DynamicRouteLoader` 类。
