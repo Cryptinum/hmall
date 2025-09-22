@@ -1225,3 +1225,241 @@ XA模式一阶段不提交事务，而是锁定资源；AT模式一阶段直接�
 XA模式依赖数据库机制实现回滚；AT模式利用数据快照实现回滚。
 
 XA模式强一致；AT模式最终一致。
+
+# Day 6 - 消息队列 上 - 微服务间的异步通信
+
+在前面实现远程调用时使用的是OpenFeign，它是一种同步调用方式。也就是说，调用方在发起请求后会一直等待，直到接收到响应结果或者发生超时异常。当在调用链路中有多个服务时，这种同步调用方式会导致请求的响应时间变长，甚至可能因为某个服务的故障而导致整个调用链路的失败，同时也存在并发效率低下的问题。
+
+为了针对性地优化一些业务的调用链，可以使用消息队列（Message Queue，MQ）来实现异步通信。消息队列是一种基于发布/订阅模式的中间件，允许一个服务将消息发送到队列中，而另一个服务从队列中接收消息并进行处理。这样，发送方和接收方可以在不同的时间进行操作，从而实现异步通信。
+
+## 基本概念
+
+通过 `pay-service` 模块中的余额支付功能（`tryPayOrderByBalance`）来说明消息队列的使用场景。项目为了了简化支付流程，省略了第三方支付平台的对接，直接在交易服务中实现了余额支付功能。当发起支付请求时，支付服务会调用用户服务来扣减用户的余额，然后再**更新支付订单**的支付状态，最后还要调用交易服务**更新交易订单**的状态。
+
+### 同步调用
+
+为了保障余额安全，需要等待扣减余额成功后才能更新支付订单状态，因此这两个操作是同步调用的。这也是同步调用的典型场景，当一个操作的结果直接影响到另一个操作时，就需要使用同步调用，**时效性最强**。
+
+但是之后的调用，或者更新的无关业务需求，如果都是同步调用的话，就会产生新的问题：
+
+1. 许多新业务都需要在支付服务的方法中实现，导致支付服务的代码臃肿，**拓展性差**。
+2. 多个同步调用的延迟积累，导致**性能下降**，影响用户体验。
+3. 当某个节点出现故障时，可能会导致**级联失效**，影响系统的稳定性。
+
+### 异步调用
+
+由于交易订单的修改与支付订单的修改之间没有直接的业务关系，因此可以将交易订单的修改操作放到一个异步任务中进行处理。
+
+考虑新的需求，如果需要在支付成功过后，发送通知、增加积分、更新用户等级等操作，这些操作都可以通过消息队列来实现异步处理，而无需在支付服务中实现。
+
+这样，支付服务在完成余额扣减和支付订单状态更新后，就可以立即返回响应结果，而不需要等待其他无关业务操作完成，从而提高了系统的响应速度和并发处理能力。
+
+在异步调用中，服务调用者和提供者的角色，转变为消息发送者和接收者。消息发送者将消息**发送到消息队列中**（**消息代理，用于管理、暂存、转发消息**），而消息接收者从消息队列中接收消息并进行处理。消息发送者和接收者之间通过消息队列进行解耦，彼此独立，可以在不同的时间进行操作。
+
+优势：解除耦合、拓展性强，无需等待、提高性能，故障隔离，缓存消息、削峰填谷
+
+问题：不能立即得到结果、**时效性低**，不确定下游业务的执行结果，业务安全依赖消息代理的可靠性
+
+### MQ的技术选择
+
+| 指标/维度      | RabbitMQ                                      | ActiveMQ                           | RocketMQ                                       | Kafka                                                                 |
+|------------|-----------------------------------------------|------------------------------------|------------------------------------------------|-----------------------------------------------------------------------|
+| **公司/社区**  | Pivotal/VMware, 社区/生态成熟                       | Apache, 社区活跃度一般                    | Alibaba, Apache, 国内社区极活跃                       | LinkedIn, Confluent, Apache, 大数据生态霸主                                  |
+| **开发语言**   | Erlang (OTP 平台, 高并发)                          | Java                               | Java                                           | Java                                                                  |
+| **协议支持**   | AMQP (核心), MQTT, STOMP (插件)                   | JMS, AMQP, MQTT, OpenWire 等 (协议最全) | 私有协议 (深度优化)                                    | 私有协议 (深度优化)                                                           |
+| **可用性**    | 镜像队列 (数据完整复制)                                 | Master-Slave (依赖 ZK)               | 多 Master-多 Slave, Dledger (Raft)               | 分区副本机制 (Partition Replicas)                                           |
+| **单机吞吐量**  | **万级/秒** (优秀)                                 | **千级/秒** (较低)                      | **十万级/秒** (非常高)                                | **百万级/秒** (最高)                                                        |
+| **消息延迟**   | **毫秒级** (低延迟)                                 | 相对较高                               | **毫秒级** (低延迟)                                  | **毫秒级** (高负载下可能略高)                                                    |
+| **消息可靠性**  | 事务, 发送方确认, ACK                                | JMS 标准持久化, 事务, ACK                 | 同步刷盘/复制, **事务消息**                              | `acks=all`, 分区多副本                                                     |
+| **核心功能特性** | **灵活的路由策略**, 插件丰富                             | 遵循 JMS 标准, 协议兼容性好                  | **事务消息, 延迟消息, 顺序消息, 消息积压**                     | **流处理平台, 消息可回溯/重放, 长期持久化**                                            |
+| **架构模型**   | 传统的 Broker-Consumer 模型 (Broker 负责路由)          | 传统的 Broker-Consumer 模型             | 传统的 Broker-Consumer 模型                         | 日志流模型 (Broker 是日志, Consumer 自行管理位移)                                   |
+| **适用场景**   | 1. 企业级应用集成<br>2. 业务逻辑复杂, 需灵活路由<br>3. 对延迟敏感的业务 | 1. 遗留系统或遵循 JMS 规范的项目<br>2. 中小型系统   | 1. **金融、电商**等对可靠性要求极高的场景<br>2. 需要事务/延迟/顺序消息的业务 | 1. **大数据管道** (日志聚合, ELT)<br>2. 事件溯源, CQRS<br>3. 流式计算 (配合 Flink/Spark) |
+
+## RabbitMQ
+
+官方文档：https://www.rabbitmq.com/tutorials
+
+### 基本架构
+
+RabbitMQ的核心组件包括**消息发送者**（Publisher）、**消息消费者**（Consumer）、**消息队列**（Queue）、**交换机**（Exchange）、**绑定**（Binding）和**虚拟主机**（Virtual Host）。
+
+1. **消息发送者**：负责将消息发送到交换机。
+2. **消息消费者**：负责从队列中接收和处理消息。
+3. **消息队列**：用于缓存消息，直到被消费者处理。
+4. **交换机**：负责接收来自消息发送者的消息，并根据路由规则将消息路由到一个或多个队列。
+5. **绑定**：用于将交换机和队列连接起来，定义消息从交换机到队列的路由规则。
+6. **虚拟主机**：用于隔离不同的应用或用户，每个虚拟主机都有自己的交换机、队列和绑定。
+
+### 安装与部署
+
+在虚拟机中运行如下命令进行docker部署
+
+```bash
+docker run \
+ -e RABBITMQ_DEFAULT_USER=rabbitmq \
+ -e RABBITMQ_DEFAULT_PASS=rabbitmq \
+ -v mq-plugins:/plugins \
+ --name rabbitmq \
+ --hostname rabbitmq \
+ -p 15672:15672 \
+ -p 5672:5672 \
+ --network hm-net\
+ -d \
+ rabbitmq:3.8-management
+```
+
+然后就可以访问 `http://192.168.*.*:15672` 进入RabbitMQ管理界面，用户名和密码均为 `rabbitmq`。
+
+## RabbitMQ控制台操作
+
+### 建立绑定
+
+需求：在RabbitMQ的控制台完成下列操作
+
+- 新建队列hello.queue1和hello.queue2
+- 向默认的amp.fanout交换机发送一条消息
+- 查看消息是否到达hello.queue1和hello.queue2
+- 总结规律
+
+1. 登录RabbitMQ控制台，进入“Queues”页面，点击“Add a new queue”按钮，创建两个队列，分别命名为 `hello.queue1` 和 `hello.queue2`，其他配置保持默认，然后点击“Add queue”按钮完成创建。
+2. 进入“Exchanges”页面，找到默认的 `amq.fanout` 交换机，点击进入。在“Publish message”部分，输入消息内容，例如 `Hello, RabbitMQ!`，然后点击“Publish message”按钮发送消息。
+    - 由于此时没有将交换机与任何队列绑定，因此消息不会被路由到任何队列中
+    - 也没有任何消费者来接收消息，因此消息会被丢弃，交换机和队列中都不会有任何消息
+    - **交换机只起到路由的作用，而无法存储消息**
+3. 进入“Queues”页面，查看 `hello.queue1` 和 `hello.queue2` 队列的消息数，应该都是0。
+4. 回到“Exchanges”页面，点击 `amq.fanout` 交换机，进入“Bindings”部分，将 `hello.queue1` 和 `hello.queue2` 队列分别绑定到 `amq.fanout` 交换机上。
+5. 再次发送消息，进入“Exchanges”页面，点击 `amq.fanout` 交换机，进入“Publish message”部分，输入消息内容，例如 `Hello, RabbitMQ!`，然后点击“Publish message”按钮发送消息。
+6. 回到“Queues”页面，查看 `hello.queue1` 和 `hello.queue2` 队列的消息数，应该都是1。
+7. 点击 `hello.queue1` 队列，进入队列详情页面，点击“Get messages”按钮，可以看到刚才发送的消息。
+    - 可见消息队列中的数据走向是：消息发送者 -> 交换机 -> 队列 -> 消费者
+    - **必须将交换机和队列绑定，消息才能被路由到队列中**
+
+### 数据隔离
+
+RabbitMQ通过虚拟主机（Virtual Host，vhost）来实现数据隔离。每个虚拟主机都有自己的交换机、队列和绑定，可以将不同的应用或用户的数据隔离开来，防止相互干扰。
+
+需求：在RabbitMQ的控制台完成下列操作
+
+- 新建一个用户hmall
+- 为hmall用户创建一个虚拟主机
+- 测试不同虚拟主机之间的数据隔离现象
+
+1. 登录RabbitMQ控制台，进入“Admin”页面，点击“Add a new user”按钮，创建一个新用户，用户名为 `hmall`，密码为 `hmall`，角色选择 `administrator`，然后点击“Add user”按钮完成创建。
+2. 在“Virtual Hosts”部分，点击“Add a new virtual host”按钮，创建一个新虚拟主机，命名为 `/hmall`，然后点击“Add virtual host”按钮完成创建。
+3. 在“Permissions”部分，选择刚才创建的用户 `hmall` 和虚拟主机 `/hmall`，然后点击“Set permission”按钮，设置该用户对该虚拟主机的权限，选择“Configure”、“Write”、“Read”权限，然后点击“Set permission”按钮完成设置。
+4. 退出当前用户，重新登录，用户名和密码均为 `hmall`，进入“Queues”页面，尝试通过“Get messages”按钮查看之前创建的 `hello.queue1` 和 `hello.queue2` 队列，应该会提示“Access refused”，因为这些队列属于默认的虚拟主机 `/`，而当前用户 `hmall` 只能访问 `/hmall` 虚拟主机。这样就实现了不同虚拟主机之间的数据隔离。
+
+## Java客户端 - Spring AMQP
+
+Spring AMQP是Spring框架提供的对AMQP协议（Advanced Message Queueing Protocol）的支持，简化了RabbitMQ的使用。Spring AMQP提供了模板用于发送和接收消息，分为两个部分，其中spring-amqp是基础抽象，而spring-rabbit是对RabbitMQ的具体实现。
+
+官方文档：https://spring.io/projects/spring-amqp#learn
+
+RabbitMQ常用的以下几种模式：
+
+1. 队列
+    - 简单队列（Simple Queue）
+    - 工作队列（Work Queue）
+2. 交换机
+    - Fanout交换机（发布订阅模式）
+    - Direct交换机（路由模式）
+    - Topic交换机（通配符模式）
+3. 其他
+    - 声明队列交换机
+    - 消息转换器
+
+### Simple Queue
+
+需求：在 `mq-demo` 项目中使用Spring AMQP实现消息的发送和接收
+
+- 利用控制台创建队列simple.queue
+- 在publisher服务中，利用SpringAMQP直接向simple.queue发送消息
+- 在consumer服务中，利用SpringAMQP编写消费者，监听simple.queue队列
+
+在 `mq-demo` 项目父工程中引入 `spring-boot-starter-amqp` 依赖，然后在配置文件中添加RabbitMQ的连接配置
+
+```yaml
+spring:
+  rabbitmq:
+    host: 192.168.*.* # 你的虚拟机IP
+    port: 5672 # 端口
+    virtual-host: /hmall # 虚拟主机
+    username: hmall # 用户名
+    password: hmall # 密码
+```
+
+创建一个测试 `com.itheima.publisher.amqp.SpringAmqpTest` ，使用 `RabbitTemplate` 发送消息
+
+```java
+
+@SpringBootTest
+public class SpringAmqpTest {
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @Test
+    public void testSimpleQueue() {
+        // 队列名称
+        String queueName = "simple.queue";
+        // 消息
+        String message = "hello, spring amqp!";
+        // 发送消息
+        rabbitTemplate.convertAndSend(queueName, message);
+    }
+}
+```
+
+在 `consumer` 模块中创建一个消费者 `com.itheima.consumer.listener.SpringRabbitListener`，使用 `@RabbitListener` 注解监听队列
+
+```java
+
+@Component
+public class SpringRabbitListener {
+    // 利用RabbitListener来声明要监听的队列信息
+    // 将来一旦监听的队列中有了消息，就会推送给当前服务，调用当前方法，处理消息。
+    // 可以看到方法体中接收的就是消息体的内容
+    @RabbitListener(queues = "simple.queue")
+    public void listenSimpleQueueMessage(String msg) throws InterruptedException {
+        System.out.println("spring 消费者接收到消息：【" + msg + "】");
+    }
+}
+```
+
+### Work Queue
+
+让多个消费者绑定到同一个队列，共同消费队列中的消息。
+
+需求：
+
+- 在RabbitMO的控制台创建一个队列，名为work.queue
+- 在publisher服务中定义测试方法，发送50条消息到work.queue
+- 在consumer服务中定义两个消息监听者，都监听work.queue队列
+
+类似地，创建两个消费者监听器方法，发现控制台的输出中，两个消费者交替接收并处理消息，说明RabbitMQ**默认使用轮询**的方式将消息分发给多个消费者。
+
+实际部署时，是部署同一个服务的不同实例，而非在同一个服务实例中编写多个监听器方法，这样就实现了**负载均衡**。
+
+如果想根据消费者的处理能力来分发消息，可以在 `application.yaml` 中配置 `spring.rabbitmq.listener.simple.prefetch` 属性，表示每个消费者在处理完当前消息之前，最多可以接收多少条未确认的消息。这样，处理能力强的消费者可以接收更多的消息，而处理能力弱的消费者则会接收较少的消息，从而实现根据处理能力分发消息。
+
+如果设置为1，那么每个消费者在处理完当前消息之前，只能接收1条未确认的消息。这样，RabbitMQ会等待消费者处理完当前消息并发送确认后，才会将下一条消息分发给该消费者，从而实现**公平分发**。
+
+### Fanout交换机
+
+也称为发布订阅模式（Publish/Subscribe），让多个队列绑定到同一个交换机，使得消息可以**广播**到所有绑定的队列。
+
+一般是用于需要同时处理的场景，例如前文提到的场景，在订单状态修改为已支付后，另外的几个服务分别进行积分增加、发送通知、日志收集等，这些业务之间彼此是不相关的，可以通过发布订阅模式来实现异步处理。
+
+### Direct交换机
+
+也称为路由模式（Routing），根据消息的路由键（Routing Key）将消息路由到不同的队列。
+
+### Topic交换机
+
+也称为通配符模式（Wildcard），根据消息的路由键和队列绑定的路由模式将消息路由到不同的队列。
+
+### 声明队列交换机
+
+### 消息转换器
+
+# Day 7 - 消息队列 下 - 可靠性与延迟消息
