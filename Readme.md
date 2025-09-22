@@ -1310,7 +1310,7 @@ docker run \
 
 然后就可以访问 `http://192.168.*.*:15672` 进入RabbitMQ管理界面，用户名和密码均为 `rabbitmq`。
 
-## RabbitMQ控制台操作
+## RabbitMQ控制台基础操作
 
 ### 建立绑定
 
@@ -1364,9 +1364,7 @@ RabbitMQ常用的以下几种模式：
     - Fanout交换机（发布订阅模式）
     - Direct交换机（路由模式）
     - Topic交换机（通配符模式）
-3. 其他
-    - 声明队列交换机
-    - 消息转换器
+    - Headers交换机（属性匹配模式，使用较少）
 
 ### Simple Queue
 
@@ -1450,16 +1448,303 @@ public class SpringRabbitListener {
 
 一般是用于需要同时处理的场景，例如前文提到的场景，在订单状态修改为已支付后，另外的几个服务分别进行积分增加、发送通知、日志收集等，这些业务之间彼此是不相关的，可以通过发布订阅模式来实现异步处理。
 
+首先在RabbitMQ控制台创建一个交换机，类型选择 `fanout`，命名为 `hmall.fanout`，然后创建两个队列，分别命名为 `fanout.queue1` 和 `fanout.queue2`，最后将这两个队列绑定到 `hmall.fanout` 交换机上。
+
+代码方面，在 `publisher` 模块中创建一个测试类 `com.itheima.publisher.amqp.FanoutTest`，使用 `RabbitTemplate` 发送消息到交换机。在 `consumer` 模块中创建两个消费者监听器方法，分别监听 `fanout.queue1` 和 `fanout.queue2` 队列。
+
+发送消息的方法与队列模式的有区别，为三个参数，其中 `exchange` 参数指定交换机名称，`routingKey` 参数在 `fanout` 交换机中不起作用，可以传入空字符串。
+
+```java
+
+@Test
+public void testFanoutExchange() {
+    // 交换机名称
+    String exchangeName = "hmall.fanout";
+    // 消息
+    String message = "hello, everyone!";
+    rabbitTemplate.convertAndSend(exchangeName, "", message);
+}
+```
+
 ### Direct交换机
 
-也称为路由模式（Routing），根据消息的路由键（Routing Key）将消息路由到不同的队列。
+也称为路由模式（Routing），根据消息的路由键（Routing Key）将消息路由到不同的队列。每一个队列都绑定到交换机上，并**指定一个路由键**。当发布者发送消息时，也需要指定一个路由键，交换机会将消息路由到所有消息和队列的路由键**完全匹配**的队列中。
+
+仍然考虑前面的场景，假设用户下订单后没有支付，而是取消，那么有的服务需要处理这个取消订单的消息，而有的服务则不需要处理。此时就可以使用路由模式来实现。
+
+首先在RabbitMQ控制台创建一个交换机，类型选择 `direct`，命名为 `hmall.direct`，然后创建两个队列，分别命名为 `direct.queue1` 和 `direct.queue2`，最后将这两个队列绑定到 `hmall.direct` 交换机上，并分别指定路由键 `red`, `blue` 和 `red`, `yellow`。
+
+代码方面，与Fanout交换机写法类似，不过发送消息时需要指定路由键。
+
+```java
+
+@Test
+public void testSendDirectExchange() {
+    // 交换机名称
+    String exchangeName = "hmall.direct";
+    // 消息
+    String message = "红色警报！";
+    // 发送消息
+    rabbitTemplate.convertAndSend(exchangeName, "red", message);
+}
+```
 
 ### Topic交换机
 
 也称为通配符模式（Wildcard），根据消息的路由键和队列绑定的路由模式将消息路由到不同的队列。
 
-### 声明队列交换机
+路由模式支持两种通配符：
 
-### 消息转换器
+- `*`：匹配一个单词，例如 `item.#` 能够匹配 `item.spu.insert` 或者 `item.spu`
+- `#`：匹配零个或多个单词，例如 `item.*` 只能匹配 `item.spu`，但不能匹配 `item.spu.insert`
+
+首先在RabbitMQ控制台创建一个交换机，类型选择 `topic`，命名为 `hmall.topic`，然后创建两个队列，分别命名为 `topic.queue1` 和 `topic.queue2`，最后将这两个队列绑定到 `hmall.topic` 交换机上，并分别指定路由模式 `china.#` 和 `#.weather`。
+
+代码方面，与Direct交换机写法相同，交换机会自动根据通配符进行路由。
+
+## 使用API声明队列和交换机
+
+Spring AMQP提供了几个接口用于声明队列、交换机和绑定关系，分别是 `Queue`、`Exchange` 和 `Binding`。可以通过@Bean的方式将这些接口的实现类注入到Spring容器中，Spring AMQP会在应用启动时自动创建这些组件。也可以通过工厂类 `XxxBuilder` 构建这些组件。
+
+### 基于类声明
+
+例如，以下代码可以用于生成一个Fanout交换机：
+
+```java
+
+@Configuration
+public class FanoutConfig {
+    /**
+     * 声明交换机
+     * @return Fanout类型交换机
+     */
+    @Bean
+    public FanoutExchange fanoutExchange() {
+        return new FanoutExchange("hmall.fanout");
+    }
+
+    /**
+     * 第1个队列
+     */
+    @Bean
+    public Queue fanoutQueue1() {
+        return new Queue("fanout.queue1");
+    }
+
+    /**
+     * 绑定队列和交换机
+     */
+    @Bean
+    public Binding bindingQueue1(Queue fanoutQueue1, FanoutExchange fanoutExchange) {
+        return BindingBuilder.bind(fanoutQueue1).to(fanoutExchange);
+    }
+
+    /**
+     * 第2个队列
+     */
+    @Bean
+    public Queue fanoutQueue2() {
+        return new Queue("fanout.queue2");
+    }
+
+    /**
+     * 绑定队列和交换机
+     */
+    @Bean
+    public Binding bindingQueue2(Queue fanoutQueue2, FanoutExchange fanoutExchange) {
+        return BindingBuilder.bind(fanoutQueue2).to(fanoutExchange);
+    }
+}
+```
+
+以下代码可以用于生成一个Direct交换机：
+
+```java
+
+@Configuration
+public class DirectConfig {
+
+    /**
+     * 声明交换机
+     * @return Direct类型交换机
+     */
+    @Bean
+    public DirectExchange directExchange() {
+        return ExchangeBuilder.directExchange("hmall.direct").build();
+    }
+
+    /**
+     * 第1个队列
+     */
+    @Bean
+    public Queue directQueue1() {
+        return new Queue("direct.queue1");
+    }
+
+    /**
+     * 绑定队列和交换机
+     */
+    @Bean
+    public Binding bindingQueue1WithRed(Queue directQueue1, DirectExchange directExchange) {
+        return BindingBuilder.bind(directQueue1).to(directExchange).with("red");
+    }
+
+    /**
+     * 绑定队列和交换机
+     */
+    @Bean
+    public Binding bindingQueue1WithBlue(Queue directQueue1, DirectExchange directExchange) {
+        return BindingBuilder.bind(directQueue1).to(directExchange).with("blue");
+    }
+
+    /**
+     * 第2个队列
+     */
+    @Bean
+    public Queue directQueue2() {
+        return new Queue("direct.queue2");
+    }
+
+    /**
+     * 绑定队列和交换机
+     */
+    @Bean
+    public Binding bindingQueue2WithRed(Queue directQueue2, DirectExchange directExchange) {
+        return BindingBuilder.bind(directQueue2).to(directExchange).with("red");
+    }
+
+    /**
+     * 绑定队列和交换机
+     */
+    @Bean
+    public Binding bindingQueue2WithYellow(Queue directQueue2, DirectExchange directExchange) {
+        return BindingBuilder.bind(directQueue2).to(directExchange).with("yellow");
+    }
+}
+```
+
+### 基于注解声明
+
+也可以使用 `@RabbitListener` 注解的 `bindings` 属性来声明队列、交换机和绑定关系。
+
+以下代码可以用于生成一个Direct交换机：
+
+```java
+
+@RabbitListener(bindings = @QueueBinding(
+        value = @Queue(name = "direct.queue1"),
+        exchange = @Exchange(name = "hmall.direct", type = ExchangeTypes.DIRECT),
+        key = {"red", "blue"}
+))
+public void listenDirectQueue1(String msg) {
+    System.out.println("消费者1接收到direct.queue1的消息：【" + msg + "】");
+}
+
+@RabbitListener(bindings = @QueueBinding(
+        value = @Queue(name = "direct.queue2"),
+        exchange = @Exchange(name = "hmall.direct", type = ExchangeTypes.DIRECT),
+        key = {"red", "yellow"}
+))
+public void listenDirectQueue2(String msg) {
+    System.out.println("消费者2接收到direct.queue2的消息：【" + msg + "】");
+}
+```
+
+以下代码可以用于生成一个Topic交换机：
+
+```java
+
+@RabbitListener(bindings = @QueueBinding(
+        value = @Queue(name = "topic.queue1"),
+        exchange = @Exchange(name = "hmall.topic", type = ExchangeTypes.TOPIC),
+        key = "china.#"
+))
+public void listenTopicQueue1(String msg) {
+    System.out.println("消费者1接收到topic.queue1的消息：【" + msg + "】");
+}
+
+@RabbitListener(bindings = @QueueBinding(
+        value = @Queue(name = "topic.queue2"),
+        exchange = @Exchange(name = "hmall.topic", type = ExchangeTypes.TOPIC),
+        key = "#.news"
+))
+public void listenTopicQueue2(String msg) {
+    System.out.println("消费者2接收到topic.queue2的消息：【" + msg + "】");
+}
+```
+
+## 消息转换器
+
+`RabbitTemplate` 中的 `convertAndSend` 方法为什么叫做 `convert` 而不是 `send` 呢？因为它会将传入的对象转换为消息体，然后发送到队列中。AMQP默认的消息体是字节数组，默认的序列化方式是JDK序列化，但是JDK的序列化有数据体积大、安全性低、可读性差等缺点，因此Spring AMQP提供了多种消息转换器（Message Converter）来满足不同的需求。
+
+### 测试默认转换器
+
+需求：测试利用SpringAMQP发送对象类型的消息
+
+- 声明一个队列，名为object.queue
+- 编写单元测试，向队列中直接发送一条消息，消息类型为Map
+- 在控制台查看消息，总结发现的问题
+
+首先在RabbitMQ控制台创建一个队列，命名为 `object.queue`。然后在 `publisher` 模块中创建一个测试方法：
+
+```java
+
+@Test
+public void testDefaultMessageConverter() {
+    String queueName = "object.queue";
+    HashMap<String, Object> msg = new HashMap<>();
+    msg.put("name", "itheima");
+    msg.put("age", 6);
+    msg.put("address", "北京");
+    rabbitTemplate.convertAndSend(queueName, msg);
+}
+```
+
+在控制台中获取消息，发现消息体是乱码的字节数组，无法查看具体的消息内容，且占用空间较大（201字节）。
+
+```text
+rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH2sHDFmDRAwACRgAKbG9hZEZhY3RvckkACXRocmVzaG9sZHhwP0AAAAAAAAx3CAAAABAAAAADdAAHYWRkcmVzc3QABuWMlS6rHQABG5hbWV0AAdpdGhlaW1hdAADYWdlc3IAEWphdmEubGFuZy5JbnRlZ2VyEuKgpPeBhzgCAAFJAAV2YWx1ZXhyABBqYXZhLmxhbmcuTnVtYmVyhqyVHQuU4IsCAAB4cAAAAAZ4
+```
+
+属性中的数据类型是 `content_type: application/x-java-serialized-object
+` ，这说明默认使用的是JDK序列化方式，通过跟踪代码，这个默认的消息转换器是 `SimpleMessageConverter`，具体操作是其中的 `createMessage` 方法，它会根据传入对象的类型选择合适的序列化方式，对于 `String` 类型使用UTF-8编码，对于 `byte[]` 类型直接使用，对于其他类型则使用JDK序列化，即实现了 `Serializable` 接口的对象，使用的是 `ObjectOutputStream` 进行序列化。
+
+### 使用JSON转换器
+
+推荐使用JSON转换器，既能保证消息体积小、可读性强，又能避免JDK序列化的安全性问题（主要是代码注入）。
+
+首先在 `publisher` 和 `consumer` 模块中都引入 `jackson-databind` 依赖（对于Java 8时间类型，还需要额外引入 `jackson-datatype-jsr310` 并配置 `ObjectMapper`），然后在配置类中配置 `Jackson2JsonMessageConverter` 消息转换器：
+
+```xml
+
+<dependencies>
+    <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.fasterxml.jackson.datatype</groupId>
+        <artifactId>jackson-datatype-jsr310</artifactId>
+    </dependency>
+</dependencies>
+```
+
+然后在两个模块的配置类中添加如下代码：
+
+```java
+
+@Bean
+public MessageConverter messageConverter() {
+    return new Jackson2JsonMessageConverter();
+}
+```
+
+再向队列中发送消息，发现消息体变成了JSON格式，且占用空间较小（45字节），可读性强。
+
+```text
+{"address":"北京","name":"itheima","age":6}
+```
+
+同时可见属性中的数据类型变成了 `content_type: application/json`，且有多个header属性指明了消息的类型，例如 `__TypeId__: java.util.HashMap`。
 
 # Day 7 - 消息队列 下 - 可靠性与延迟消息
