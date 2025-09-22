@@ -1673,11 +1673,11 @@ public void listenTopicQueue2(String msg) {
 }
 ```
 
-## 消息转换器
+### 消息转换器
 
 `RabbitTemplate` 中的 `convertAndSend` 方法为什么叫做 `convert` 而不是 `send` 呢？因为它会将传入的对象转换为消息体，然后发送到队列中。AMQP默认的消息体是字节数组，默认的序列化方式是JDK序列化，但是JDK的序列化有数据体积大、安全性低、可读性差等缺点，因此Spring AMQP提供了多种消息转换器（Message Converter）来满足不同的需求。
 
-### 测试默认转换器
+#### 测试默认转换器
 
 需求：测试利用SpringAMQP发送对象类型的消息
 
@@ -1709,7 +1709,7 @@ rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH2sHDFmDRAwACRgAKbG9hZEZhY3RvckkACXRocmVzaG9s
 属性中的数据类型是 `content_type: application/x-java-serialized-object
 ` ，这说明默认使用的是JDK序列化方式，通过跟踪代码，这个默认的消息转换器是 `SimpleMessageConverter`，具体操作是其中的 `createMessage` 方法，它会根据传入对象的类型选择合适的序列化方式，对于 `String` 类型使用UTF-8编码，对于 `byte[]` 类型直接使用，对于其他类型则使用JDK序列化，即实现了 `Serializable` 接口的对象，使用的是 `ObjectOutputStream` 进行序列化。
 
-### 使用JSON转换器
+#### 使用JSON转换器
 
 推荐使用JSON转换器，既能保证消息体积小、可读性强，又能避免JDK序列化的安全性问题（主要是代码注入）。
 
@@ -1746,5 +1746,112 @@ public MessageConverter messageConverter() {
 ```
 
 同时可见属性中的数据类型变成了 `content_type: application/json`，且有多个header属性指明了消息的类型，例如 `__TypeId__: java.util.HashMap`。
+
+## 业务改造
+
+在 `pay-service` 模块的 `tryPayOrderByBalance` 方法中，将支付成功后更新交易订单的操作，改为发送一条消息到RabbitMQ，由交易服务异步接收并处理。这个操作调用了 `TradeClient.markOrderPaySuccess`，对应到Controller就是 `trade-service` 模块的 `OrderController.markOrderPaySuccess` 方法。
+
+### 配置RabbitMQ
+
+为生产者和消费者均引入 `spring-boot-starter-amqp` 依赖：
+
+```xml
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-amqp</artifactId>
+</dependency>
+```
+
+在 `application.yaml` 中配置RabbitMQ的连接信息，建议抽取到Nacos然后配置到 `bootstrap.yaml` 中：
+
+```yaml
+spring:
+  rabbitmq:
+    host: 192.168.*.* # 你的虚拟机IP
+    port: 5672 # 端口
+    virtual-host: /hmall # 虚拟主机
+    username: hmall # 用户名
+    password: hmall # 密码
+```
+
+在 `hm-common` 模块中创建一个配置类 `com.itheima.common.config.MqConfig`，用于声明消息转换器：
+
+```java
+
+@Configuration
+public class MqConfig {
+    @Bean
+    public MessageConverter messageConverter() {
+        return new Jackson2JsonMessageConverter();
+    }
+}
+```
+
+由于配置类处于 `hm-common` 模块中，因此需要在 `pay-service` 和 `trade-service` 模块的启动类上添加 `@ComponentScan` 注解，扫描 `com.hmall.common.config` 包。或者在 `hm-common` 模块中的 `META-INF/spring.factories` 文件中添加如下配置：
+
+```properties
+org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
+    com.hmall.common.config.MqConfig
+```
+
+### 编写消息监听器
+
+在 `trade-service` 模块中创建一个消息监听器类 `com.hmall.trade.listener.PayStatusListener`，用于监听支付成功的消息：
+
+```java
+
+@Component
+@Slf4j
+@RequiredArgsConstructor  // 注入使用构造器注入
+public class PayStatusListener {
+
+    // 注入订单服务
+    private final IOrderService orderService;
+
+    @RabbitListener(bindings = @QueueBinding(
+            value = @Queue(value = "trade.pay.success.queue", durable = "true"),
+            exchange = @Exchange(name = "pay.direct", durable = "true", type = "direct"),
+            key = {"pay.success"}
+    ))
+    public void listenPaySuccess(Long orderId) {
+        log.info("接收到支付成功的消息，订单ID：{}", orderId);
+        // 调用订单服务，更新订单状态，逻辑与markOrderPaySuccess一致
+        orderService.markOrderPaySuccess(orderId);
+    }
+}
+```
+
+### 编写消息发送者
+
+在 `pay-service` 模块的 `PayOrderServiceImpl` 类中，注入 `RabbitTemplate`，并在 `tryPayOrderByBalance` 方法中发送支付成功的消息：
+
+```java
+
+@Service
+@RequiredArgsConstructor
+public class PayOrderServiceImpl extends ServiceImpl<PayOrderMapper, PayOrder> implements IPayOrderService {
+    // private final TradeClient tradeClient;
+    private final RabbitTemplate rabbitTemplate;
+
+    @Override
+    @Transactional
+    public void tryPayOrderByBalance(PayOrderFormDTO payOrderFormDTO) {
+        // ...扣减余额和修改支付单状态的代码...
+
+        // 原本的修改订单状态逻辑
+        // tradeClient.markOrderPaySuccess(po.getBizOrderNo());
+
+        // 发送支付成功的消息
+        try {
+            rabbitTemplate.convertAndSend("pay.direct", "pay.success", po.getBizOrderNo());
+        } catch (Exception e) {
+            log.error("支付成功消息发送失败，订单ID：{}", po.getBizOrderNo(), e);
+        }
+    }
+}
+```
+
+> 这里使用try-catch是为了不影响主要业务逻辑，**防止消息发送失败导致整个支付流程回滚**，实际项目中可以根据业务需求决定是否需要重试或者补偿机制，在catch代码块中实现具体逻辑。
 
 # Day 7 - 消息队列 下 - 可靠性与延迟消息
