@@ -1,10 +1,10 @@
 package com.hmall.trade.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.hmall.api.client.CartClient;
 import com.hmall.api.client.ItemClient;
 import com.hmall.api.dto.ItemDTO;
 import com.hmall.api.dto.OrderDetailDTO;
+import com.hmall.common.domain.CartCleanMessage;
 import com.hmall.common.exception.BadRequestException;
 import com.hmall.common.utils.UserContext;
 import com.hmall.trade.domain.dto.OrderFormDTO;
@@ -15,13 +15,12 @@ import com.hmall.trade.service.IOrderDetailService;
 import com.hmall.trade.service.IOrderService;
 import io.seata.spring.annotation.GlobalTransactional;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
@@ -33,12 +32,15 @@ import java.util.stream.Collectors;
  * @since 2023-05-05
  */
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements IOrderService {
 
     private final IOrderDetailService detailService;
-    private final CartClient cartClient;
+    // private final CartClient cartClient;
     private final ItemClient itemClient;
+
+    private final RabbitTemplate rabbitTemplate;
 
     @Override
     // @Transactional
@@ -74,8 +76,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         List<OrderDetail> details = buildDetails(order.getId(), items, itemNumMap);
         detailService.saveBatch(details);
 
-        // 3.清理购物车商品
-        cartClient.deleteCartItemByIds(itemIds);
+        // // 3.清理购物车商品
+        // cartClient.deleteCartItemByIds(itemIds);
 
         // 4.扣减库存
         try {
@@ -83,6 +85,17 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         } catch (Exception e) {
             throw new RuntimeException("库存不足！");
         }
+
+        // 5.发送消息，清理购物车
+        CartCleanMessage msg = CartCleanMessage.builder()
+                .userId(UserContext.getUser())
+                .itemIds(itemIds).build();
+        try {
+            rabbitTemplate.convertAndSend("trade.topic", "order.create", msg);
+        } catch (Exception e) {
+            log.error("订单微服务-发送清理购物车消息失败，用户id：{}，商品id集合：{}", UserContext.getUser(), itemIds, e);
+        }
+
         return order.getId();
     }
 

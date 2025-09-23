@@ -70,6 +70,7 @@ public class PayOrderServiceImpl extends ServiceImpl<PayOrderMapper, PayOrder> i
         // tradeClient.markOrderPaySuccess(po.getBizOrderNo());
 
         // 5.发送支付成功的消息
+        // 由于上面已经判断了success，所以这里理论上不会失败
         try {
             rabbitTemplate.convertAndSend("pay.direct", "pay.success", po.getBizOrderNo());
         } catch (Exception e) {

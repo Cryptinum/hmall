@@ -1854,4 +1854,74 @@ public class PayOrderServiceImpl extends ServiceImpl<PayOrderMapper, PayOrder> i
 
 > 这里使用try-catch是为了不影响主要业务逻辑，**防止消息发送失败导致整个支付流程回滚**，实际项目中可以根据业务需求决定是否需要重试或者补偿机制，在catch代码块中实现具体逻辑。
 
+### 使用技巧 - 用POJO类封装发送的消息
+
+在实际项目中，发送的消息往往是一个复杂的对象，而不仅仅是一个简单的ID或者字符串。为了提高代码的可读性和维护性，建议使用POJO类来封装发送的消息。
+
+例如在 `trade-service` 的 `OrderServiceImpl.createOrder` 方法中，订单创建成功后，需要发送一条消息通知购物车服务清空购物车，可以创建一个POJO类 `com.hmall.trade.message.CartCleanMessage` 来封装消息内容：
+
+```java
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class CartCleanMessage implements Serializable {
+    private Long userId;
+    private Collection<Long> itemIds;
+}
+```
+
+然后在 `OrderServiceImpl` 中发送消息：
+
+```java
+@Override
+@GlobalTransactional  // seata分布式事务
+public Long createOrder(OrderFormDTO orderFormDTO) {
+    // ...订单处理逻辑...
+
+    // 发送消息，清理购物车
+    CartCleanMessage msg = CartCleanMessage.builder()
+            .userId(UserContext.getUser())
+            .itemIds(itemIds).build();
+    try {
+        rabbitTemplate.convertAndSend("trade.topic", "order.create", msg);
+    } catch (Exception e) {
+        log.error("订单微服务-发送清理购物车消息失败，用户id：{}，商品id集合：{}", UserContext.getUser(), itemIds, e);
+    }
+
+    // ...返回订单ID的逻辑
+}
+```
+
 # Day 7 - 消息队列 下 - 可靠性与延迟消息
+
+## 可靠性 - 发送者
+
+### 发送者重连
+
+### 发送确认机制
+
+## 可靠性 - 消息队列
+
+### 消息持久化
+
+### LazyQueue
+
+## 可靠性 - 消费者
+
+### 消费者确认机制
+
+### 消息重试与补偿
+
+### 幂等性设计
+
+## 延迟消息
+
+### 基本概念
+
+### 死信交换机
+
+### 延迟消息插件
+
+## 业务改造 - 取消超时订单
