@@ -2548,3 +2548,90 @@ public void testDelayExchange() {
 ```
 
 ## 业务改造 - 取消超时订单
+
+考虑上一节中，用户下单的业务场景，用户下单调用交易服务，交易服务首先保存订单，然后远程调用商品服务锁定库存，保证用户下单成功后，商品库存不会被其他用户抢占。另一方面，用户在下单后，会根据是否成功支付通过MQ向交易服务发送一条消息，如果MQ消息没有成功发送，那么交易服务不会更新订单状态，根据成功支付与否分为两种情况：
+
+- 如果成功支付，更新付款订单的状态为已支付，商品库存被正确扣除，只有订单状态不一致，只会影响用户体验，可以通过前文讨论的消息可靠性进行消息重试等处理
+- 如果未支付，那么看似付款订单和交易订单的状态是同步的，但是商品服务的库存并没有恢复，实际上也是不一致的，这种情况会严重影响商品的销量准确性，需要特殊处理
+
+本节通过MQ的延迟消息插件进行业务改造：
+
+- 当用户通过交易服务下单时，由交易服务向支付服务发送一条延迟消息，延迟时间为订单的支付超时时间15分钟
+- 如果短时间内，交易服务已经收到了支付服务发送的支付成功消息，那么交易服务更新订单状态为已支付，无需理会延迟消息
+- 以下基于短时间内两个服务出现不一致的情况：
+    - 如果用户在15分钟内成功支付，那么延迟消息到达时，支付服务会向交易服务发送一条支付成功的消息，交易服务更新订单状态为已支付
+    - 如果用户在15分钟内没有支付，那么延迟消息到达时，支付服务发现订单仍然是未支付状态，那么就发送消息，通知交易服务关闭订单，并且调用商品服务恢复库存
+
+### 定义交换机、队列和消费者
+
+```java
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class OrderDelayMessageListener {
+
+    private final IOrderService orderService;
+
+    @RabbitListener(bindings = @QueueBinding(
+            value = @Queue(value = MQConstants.DELAY_QUEUE_NAME, durable = "true"),
+            exchange = @Exchange(value = MQConstants.DELAY_EXCHANGE_NAME, delayed = "true"),
+            key = MQConstants.DELAY_ROUTING_KEY
+    ))
+    public void listenOrderDelayMessage(Long orderId) {
+        orderService.listenOrderDelayMessage(orderId);
+    }
+}
+```
+
+### 实现业务方法
+
+```java
+
+@Override
+public void listenOrderDelayMessage(Long orderId) {
+    // 1. 查询订单
+    Order order = getById(orderId);
+
+    // 2. 检测订单状态，如果已支付，那么直接返回
+    if (order == null || order.getStatus() != 1) {
+        return;
+    }
+
+    // 3. 如果未支付，那么需要查询支付流水
+    PayOrderDTO payOrder = payClient.queryPayOrderByBizOrderNo(orderId);
+
+    // 4. 判断支付流水是否已支付
+    if (payOrder == null) {
+        return;
+    }
+    if (payOrder.getStatus() == 3) {
+        // 4.1 如果已支付，那么更新订单状态为已支付
+        markOrderPaySuccess(orderId);
+    } else {
+        // 4.2 如果未支付，那么更新订单状态为已取消，同时恢复商品库存
+        cancelOrder(orderId);
+    }
+}
+```
+
+```java
+
+@GlobalTransactional
+public void cancelOrder(Long orderId) {
+    // 1.更新订单状态为已取消
+    Order order = new Order();
+    order.setId(orderId);
+    order.setStatus(5);
+    order.setUpdateTime(LocalDateTime.now());
+    order.setCloseTime(LocalDateTime.now());
+    updateById(order);
+
+    // 2.恢复商品库存
+    List<OrderDetail> details = detailService.lambdaQuery().eq(OrderDetail::getOrderId, orderId).list();
+    List<OrderDetailDTO> orderDetailDTOS = BeanUtils.copyList(details, OrderDetailDTO.class);
+    itemClient.restoreStock(orderDetailDTOS);
+}
+```
+
+其他业务逻辑主要涉及到Feign的远程调用，略。

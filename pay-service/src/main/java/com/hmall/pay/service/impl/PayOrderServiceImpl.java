@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.baomidou.mybatisplus.core.toolkit.StringUtils;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmall.api.client.UserClient;
+import com.hmall.common.constants.MQConstants;
 import com.hmall.common.exception.BizIllegalException;
 import com.hmall.common.utils.BeanUtils;
 import com.hmall.common.utils.UserContext;
@@ -72,7 +73,10 @@ public class PayOrderServiceImpl extends ServiceImpl<PayOrderMapper, PayOrder> i
         // 5.发送支付成功的消息
         // 由于上面已经判断了success，所以这里理论上不会失败
         try {
-            rabbitTemplate.convertAndSend("pay.direct", "pay.success", po.getBizOrderNo());
+            rabbitTemplate.convertAndSend(
+                    MQConstants.PAY_EXCHANGE_NAME,
+                    MQConstants.PAY_SUCCESS_KEY,
+                    po.getBizOrderNo());
         } catch (Exception e) {
             log.error("支付成功消息发送失败，订单ID：{}", po.getBizOrderNo(), e);
         }

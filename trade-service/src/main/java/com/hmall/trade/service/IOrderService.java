@@ -19,4 +19,6 @@ public interface IOrderService extends IService<Order> {
     void markOrderPaySuccess(Long orderId);
 
     void listenPaySuccess(Long orderId);
+
+    void listenOrderDelayMessage(Long orderId);
 }

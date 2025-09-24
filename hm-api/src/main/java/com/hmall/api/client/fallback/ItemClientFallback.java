@@ -1,4 +1,4 @@
-package com.hmall.api.fallback;
+package com.hmall.api.client.fallback;
 
 import com.hmall.api.client.ItemClient;
 import com.hmall.api.dto.ItemDTO;
@@ -17,7 +17,7 @@ import java.util.List;
  */
 
 @Slf4j
-public class ItemClientFallbackFactory implements FallbackFactory<ItemClient> {
+public class ItemClientFallback implements FallbackFactory<ItemClient> {
     @Override
     public ItemClient create(Throwable cause) {
         return new ItemClient() {
@@ -30,6 +30,12 @@ public class ItemClientFallbackFactory implements FallbackFactory<ItemClient> {
             @Override
             public void deductStock(List<OrderDetailDTO> items) {
                 log.error("调用item-service的deductStock方法失败", cause);
+                throw new RuntimeException(cause);
+            }
+
+            @Override
+            public void restoreStock(List<OrderDetailDTO> items) {
+                log.error("调用item-service的restoreStock方法失败", cause);
                 throw new RuntimeException(cause);
             }
         };

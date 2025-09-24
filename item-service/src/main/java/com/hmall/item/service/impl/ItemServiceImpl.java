@@ -64,6 +64,24 @@ public class ItemServiceImpl extends ServiceImpl<ItemMapper, Item> implements II
     }
 
     @Override
+    public void restoreStock(List<OrderDetailDTO> items) {
+        // 这里的逻辑实际上和 deductStock 一致，只是语义不同
+        boolean r;
+        try {
+            r = executeBatch(items, (sqlSession, entity) -> {
+                ItemMapper mapper = sqlSession.getMapper(ItemMapper.class);
+                mapper.restoreStock(entity);
+            });
+        } catch (Exception e) {
+            throw new BizIllegalException("恢复库存异常，可能出现业务一场!", e);
+        }
+        if (!r) {
+            throw new BizIllegalException("恢复库存失败！");
+        }
+
+    }
+
+    @Override
     public List<ItemDTO> queryItemByIds(Collection<Long> ids) {
         return BeanUtils.copyList(listByIds(ids), ItemDTO.class);
     }
