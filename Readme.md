@@ -1909,10 +1909,19 @@ public Long createOrder(OrderFormDTO orderFormDTO) {
 - **消息队列可靠性**：确保消息在消息代理中不会丢失
 - **消费者可靠性**：确保消费者能够成功接收并处理消息
 
+即便已经采用了多种手段对消息可靠性进行保障，消息仍然有可能处理失败，这时需要设计兜底策略进行处理，具体分为
+
 > 总结：如何保证支付服务与交易服务之间的消息可靠性？
 > - 首先，我们使用了MQ消息通知机制，对交易服务通知，并进行异步处理，缩短主要业务的流程和处理时间，提高了系统的可用性
 > - 其次，我们从发送者、消息队列和消费者三个环节对MQ消息通知的可靠性进行了保障。发送者方面提供了发送者确认和发送者重连机制；消费者方面提供了消费者确认和消费者重试机制；消息队列方面提供了消息的持久化，保障了数据安全
 > - 最后，我们还针对特定业务场景，设计了幂等性处理，在保障消息**至少被处理一次**的同时，**避免了重复处理**带来的数据不一致问题
+
+> 总结：RabbitMQ延迟消息插件是如何管理不同延迟时间的消息的？
+> - RabbitMQ本身不支持延迟队列功能，但是可以通过TTL和死信队列来实现延迟消息，也可以通过延迟消息插件来实现，以下是延迟消息插件的处理方案
+> - 插件中通过将交换机设置为延迟交换机，消息发送到交换机时，可以指定一个延迟时间，交换机会将消息存储在内部的延迟队列中，直到延迟时间到达后，再将消息路由到绑定的队列中
+> - 针对不同的延迟时间，插件内部会维护一个**优先级队列**，通常用最小堆实现，所有被发送到延迟交换机的消息，都会被放入这个优先级队列中，并根据它们的**绝对投递时间戳**（也就是 `当前时间 + 投递时间`）进行排序
+> - 插件内部有一个轻量级的Erlang进程充当计时器，工作原理是**计算出下一次需要投递消息的确切时间点，然后设置一个闹钟，并一直睡到那个时间点再醒来**。因此该进程大部分时间都是在睡眠状态，不会占用过多的CPU资源
+> - 死信队列的问题在于它是FIFO的，如果一条延迟60分钟的消息先进队，后面又有一条延迟1分钟的消息，那么1分钟的消息就会被60分钟的消息阻塞，称为队头阻塞
 
 ## 可靠性 - 发送者
 
@@ -2340,10 +2349,202 @@ public void listenPaySuccess(Long orderId) {
 
 ## 延迟消息 - 兜底方案
 
+仍然考虑用户下单的业务场景，用户下单调用交易服务，交易服务首先保存订单，然后远程调用商品服务**锁定库存**，保证用户下单成功后，商品库存不会被其他用户抢占。
+
+另一方面，就是前文分析的场景，用户在下单后，会根据是否成功支付通过MQ向交易服务发送一条消息，如果MQ消息没有成功发送，那么交易服务不会更新订单状态，根据成功支付与否分为两种情况：
+
+- 如果成功支付，更新付款订单的状态为已支付，商品库存被正确扣除，只有订单状态不一致，只会影响用户体验，可以通过前文讨论的消息可靠性进行消息重试等处理
+- 如果未支付，那么看似付款订单和交易订单的状态是同步的，但是商品服务的库存并没有恢复，实际上也是不一致的，这种情况会严重影响商品的销量准确性，需要特殊处理
+
+其中一个解决方案是使用苍穹外卖中使用的**Spring Task**，创建一个定时任务，定期扫描未支付的订单，如果发现某个订单已经超过了支付时间，那么就将该订单取消，并且调用商品服务恢复库存。
+
+另一个更优雅的解决方案是通过MQ的**延迟消息**功能：
+
+- 当用户通过交易服务下单时，由交易服务向支付服务发送一条延迟消息，延迟时间为订单的支付超时时间（例如30分钟）
+- 在已实现的功能中，正常情况下，交易服务和支付服务的数据同步是在短时间内达成的。以下基于短时间内两个服务出现不一致的情况，分析延迟消息作为兜底策略的行为：
+    - 如果用户在30分钟内成功支付，那么延迟消息到达时，支付服务会向交易服务发送一条支付成功的消息，交易服务更新订单状态为已支付
+    - 如果用户在30分钟内没有支付，那么延迟消息到达时，支付服务发现订单仍然是未支付状态，那么就发送消息，通知交易服务取消订单，并且调用商品服务恢复库存
+
 ### 基本概念
+
+**延迟消息**是指，发送者发送消息时指定一个**延迟时间**，消费者不会立刻受到消息，而是**在指定的延迟时间后才会收到消息**并处理。这样即便网络出现故障，消息无法发送成功，那么在延迟时间内网络恢复后，消息仍然可以被发送成功，从而保障数据的一致性。
+
+**延迟任务**是指，设置在延迟时间之后才会去执行的任务，可以通过延迟消息实现。
 
 ### 死信交换机
 
+RabbitMQ本身是不支持延迟消息的，但是可以通过**死信交换机**（Dead Letter Exchange，DLX）来实现延迟消息的功能。
+
+当一个队列中的消息满足以下情况之一时，就会称为死信：
+
+- **重入队失败**：消费者拒绝或不重新入队
+    - `basic.reject` （返回REJECT），或者
+    - `basic.nack` （返回NACK）声明消费失败，并且 `requeue` 参数被设置为 `false`
+- **消息过期**：消息是过期消息，超时无消费者进行消费
+    - 达到了队列或消息本身设置的的TTL（队列也可以设置TTL）
+- **队列已满**：队列达到最大长度，无法容纳更多消息
+    - 要投递的队列消息堆积满了，最早的消息可能会被丢弃并成为死信
+
+如果队列通过 `dead-letter-exchange` 参数绑定了一个死信交换机，那么当队列中的消息成为死信时，消息会被重新发布到该死信交换机中，然后根据路由键路由到绑定的队列中。
+
+首先分别创建一组普通/死信的交换机/队列，分别为 `normal.direct`、`normal.queue` 和 `dlx.direct`、`dlx.queue`，其中需要做几件事：
+
+- 为普通队列设置TTL，例如30秒
+- 将发送者绑定到普通交换机
+- 将消费者绑定到死信队列
+- 将普通队列通过 `dead-letter-exchange = dlx.direct` 参数绑定到死信交换机：
+
+这样就能实现延迟消息的功能：发送者发送消息到普通交换机，路由到普通队列。由于普通队列没有绑定消费者，那么消息会在队列中等待30秒。30秒后，消息过期，成为死信，普通队列将死信发送到死信交换机 -> 路由到死信队列 -> 推送给消费者。
+
+```text
+=== 步骤 1: 生产者发送一条带 TTL 的消息到普通交换机 ===
+
++-----------+   msg(TTL=30s, routing_key="order.delay") 
+| Publisher | ------------------------------------------> [Exchange: normal.direct]
++-----------+
+                                                                     |
+                                                                     | Binding (key="order.delay")
+                                                                     v
+
+=== 步骤 2: 消息进入普通队列，该队列配置了死信交换机，消息在此等待过期 ===
+
+                                             +----------------------------------------------+
+                                             | Queue: normal.queue                          |
+                                             | * Properties:                                |
+                                             |   - x-dead-letter-exchange: dlx.direct       |
+                                             |   - x-dead-letter-routing-key: order.process |
+                                             +----------------------------------------------+
+                                                                     |
+                                                                     | (30秒后, 消息过期变成“死信”, 被自动转发到 DLX)
+                                                                     v
+
+=== 步骤 3: 死信交换机(DLX)接收到死信，并根据路由键将其路由到真正的消费队列 ===
+
+                                                          [Exchange: dlx.direct]
+                                                                     |
+                                                                     | Binding (key="order.process")
+                                                                     v
+
+=== 步骤 4: 消费者从最终队列中获取到“延迟”后的消息进行处理 ===
+
+                                                           [Queue: dlx.queue] ---------> +----------+
+                                                                                         | Consumer |
+                                                                                         +----------+
+```
+
+首先定义死信交换机、死信队列、接收者：
+
+```java
+
+@RabbitListener(bindings = @QueueBinding(
+        value = @Queue(name = "dlx.queue", durable = "true"),
+        exchange = @Exchange(name = "dlx.direct", durable = "true", type = "direct"),
+        key = {"order.process"}
+))
+public void listenDlxQueue(String msg) {
+    log.info("消费者接收到dlx.queue的消息：{}", msg);
+}
+```
+
+然后定义普通交换机、普通队列，并将普通队列绑定到死信交换机：
+
+```java
+
+@Configuration
+public class NormalMessageConfiguration {
+
+    @Bean
+    public DirectExchange normalExchange() {
+        return ExchangeBuilder.directExchange("normal.direct").durable(true).build();
+    }
+
+    @Bean
+    public Queue normalQueue() {
+        return QueueBuilder
+                .durable("normal.queue")  // 普通队列
+                .deadLetterExchange("dlx.direct")  // 绑定死信交换机
+                .deadLetterRoutingKey("order.process")  // 设置在死信交换机中的路由键
+                .build();
+    }
+
+    @Bean
+    public Binding normalBinding(Queue normalQueue, DirectExchange normalExchange) {
+        return BindingBuilder.bind(normalQueue).to(normalExchange).with("order.delay");
+    }
+}
+```
+
+最后定义发送者，发送一条消息到普通交换机，同时指定一个过期时间：
+
+```java
+public void testDlx() {
+    rabbitTemplate.convertAndSend("normal.direct", "order.delay", "hello", message -> {
+                // 设置消息的过期时间为30秒
+                message.getMessageProperties().setExpiration("30000");
+                return message;
+            }
+    );
+    log.info("消息发送完成");
+}
+```
+
 ### 延迟消息插件
+
+使用死信交换机实现延迟消息，虽然逻辑清晰，但是实现起来过于繁琐。从RabbitMQ 3.7.x版本开始，官方提供了一个**延迟消息插件**（Github: [rabbitmq-delayed-message-exchange](https://github.com/rabbitmq/rabbitmq-delayed-message-exchange)），可以直接使用。
+
+这个插件可以将普通交换机改造为支持延迟消息功能的交换机，当消息投递到交换机后可以暂存一段时间，到期后再投递到队列。当发送了一条设置TTL的消息后，交换机内部有一个计时器，等到TTL时间到达后，交换机再将消息路由到绑定的队列中。
+
+在控制台使用时只需要在创建交换机时指定类型为 `x-delayed-message`，并且设置一个参数 `x-delayed-type`，值为普通的交换机类型（如 `direct`、`topic` 等）。
+
+首先查看RabbitMQ插件存放的数据卷挂载地址：
+
+```bash 
+docker volume inspect mq-plugins
+```
+
+然后将下载的插件复制 `Mountpoint` 属性对应的目录下，最后执行以下命令启用插件，等待一段时间即可：
+
+```bash
+docker exec -it rabbitmq rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+
+然后定义一个延迟交换机和队列，并将队列绑定到交换机：
+
+```java
+// 通过注解的方式声明
+@RabbitListener(bindings = @QueueBinding(
+        value = @Queue(name = "delay.queue", durable = "true"),
+        exchange = @Exchange(name = "delay.direct", delayed = "true"),
+        key = "delay"
+))
+public void listenDelayMessage(String msg) {
+    log.info("接收到delay.queue的延迟消息：{}", msg);
+}
+
+// 或者基于Bean的方式声明
+@Bean
+public DirectExchange delayExchange() {
+    return ExchangeBuilder
+            .directExchange("delay.direct")  // 指定交换机类型和名称
+            .delayed()  // 设置delay的属性为true
+            .durable(true)  // 持久化
+            .build();
+}
+```
+
+发送延迟消息时，需要在消息属性中设置 `x-delay` 参数，指定延迟的时间，单位为毫秒：
+
+```java
+
+@Test
+public void testDelayExchange() {
+    rabbitTemplate.convertAndSend("delay.direct", "delay", "hello, spring amqp delay message!", message -> {
+                // 新版本中为setDelayLong
+                message.getMessageProperties().setDelay(10000);
+                return message;
+            }
+    );
+}
+```
 
 ## 业务改造 - 取消超时订单
