@@ -29,6 +29,6 @@ public class PayStatusListener {
     ))
     public void listenPaySuccess(Long orderId) {
         log.info("接收到支付成功的消息，订单ID：{}", orderId);
-        orderService.markOrderPaySuccess(orderId);
+        orderService.listenPaySuccess(orderId);
     }
 }

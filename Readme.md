@@ -287,7 +287,7 @@ Nacos就是一个开源的，用于构建云原生应用的动态服务发现、
 PREFER_HOST_MODE=hostname
 MODE=standalone
 SPRING_DATASOURCE_PLATFORM=mysql
-MYSQL_SERVICE_HOST=192.168.168.168
+MYSQL_SERVICE_HOST=192.168.*.*
 MYSQL_SERVICE_DB_NAME=nacos
 MYSQL_SERVICE_PORT=3306
 MYSQL_SERVICE_USER=root
@@ -331,7 +331,7 @@ spring:
     name: trade-service  # 服务名称
   cloud:
     nacos:
-      server-addr: 192.168.168.168:8848
+      server-addr: 192.168.*.*:8848
 ```
 
 针对一个服务配置多个实例的情况，可以在Idea的启动项中复制某个服务的运行配置，然后配置修改端口号的虚拟机选项 `-Dserver.port=xxxx` 即可，该选项只对当前运行配置生效。
@@ -1875,6 +1875,7 @@ public class CartCleanMessage implements Serializable {
 然后在 `OrderServiceImpl` 中发送消息：
 
 ```java
+
 @Override
 @GlobalTransactional  // seata分布式事务
 public Long createOrder(OrderFormDTO orderFormDTO) {
@@ -1896,27 +1897,448 @@ public Long createOrder(OrderFormDTO orderFormDTO) {
 
 # Day 7 - 消息队列 下 - 可靠性与延迟消息
 
+仍然考虑上一章中的业务，在支付服务中，第一步调用用户服务尝试扣减用户余额，第二步修改支付订单状态，如果订单已支付，那么第三步支付服务向消息代理发送一条支付成功的消息，交易服务异步接收并处理该消息，修改交易订单状态。
+
+现在考虑这样一个场景，前两步扣减余额和修改支付订单状态都成功了，但是在第三步发送消息时，网络出现故障，导致消息发送失败，那么交易订单的状态就不会被更新，用户会看到订单一直处于未支付状态，导致同步出现问题，影响用户体验。
+
+为了确保用户体验的一致性，那么就需要第三步中支付服务发出的消息能够**可靠地**到达交易服务，交易服务也能够**可靠地**处理该消息。这就需要我们在设计和实现时，考虑消息的可靠性问题。
+
+那么从数据流向的角度来看，消息可靠性可以分为三个环节：
+
+- **发送者可靠性**：确保消息能够成功发送到消息代理
+- **消息队列可靠性**：确保消息在消息代理中不会丢失
+- **消费者可靠性**：确保消费者能够成功接收并处理消息
+
+> 总结：如何保证支付服务与交易服务之间的消息可靠性？
+> - 首先，我们使用了MQ消息通知机制，对交易服务通知，并进行异步处理，缩短主要业务的流程和处理时间，提高了系统的可用性
+> - 其次，我们从发送者、消息队列和消费者三个环节对MQ消息通知的可靠性进行了保障。发送者方面提供了发送者确认和发送者重连机制；消费者方面提供了消费者确认和消费者重试机制；消息队列方面提供了消息的持久化，保障了数据安全
+> - 最后，我们还针对特定业务场景，设计了幂等性处理，在保障消息**至少被处理一次**的同时，**避免了重复处理**带来的数据不一致问题
+
 ## 可靠性 - 发送者
+
+发送者可靠性主要包括两个方面：
+
+1. 发送者重连：关注消息是否能被MQ正确接收
+2. 发送确认机制：关注消息是否能被正确路由到队列
+
+> 注意：当网络不稳定的时候，利用**发送者重连机制**可以有效提高消息发送的成功率，然而Spring AMQP提供的重试机制是**阻塞式**的，在多次重试期间，当前线程会一直被阻塞，极大影响业务性能。
+
+> 如果对于业务性能有要求，建议**禁用重试机制**。如果一定要使用的话，就需要合理配置等待时长、等待乘数和最大重试次数，避免频繁重试影响业务性能。另一种方法是使用异步发送消息，发送失败后再异步重试。
+
+> 注意：**发送者确认机制**同样比较消耗MQ的性能，一般不建议开启，另外我们考虑一些触发的情况
+> - 路由失败：一般是Routing Key错误，或者交换机没有绑定队列，这种情况重发消息没有意义，是编程错误
+> - 交换机名称错误：也是编程错误，重发消息没有意义
+> - MQ内部故障：这种情况可以重发消息，但是概率非常低，因此只有在业务对消息可靠性要求非常高的情况下，才考虑开启发送确认机制。而且一般仅开启 `ConfirmCallback` 回调函数处理NACK就够了，进入 `ReturnCallback` 一般是编程错误，禁用来辅助提供调试信息
 
 ### 发送者重连
 
+有时因为网络波动，可能会出现发送者连接MQ失败的情况。通过配置可以让发送者在连接失败时自动重连，默认是关闭的。发送者重连机制类似以太网的截断二进制指数退避，即每次连接失败后，等待一段时间再重试，等待时间逐渐增加，直到达到最大重试次数。
+
+```yaml
+spring:
+  rabbitmq:
+    connection-timeout: 1s # 设置MQ的连接超时时间，如果超时则失败
+    template:
+      retry:
+        enabled: true # 开启超时重试机制，超时失败时自动重试，默认false
+        initial-interval: 1000ms # 失败后的初始等待时间，降低长时间网络波动的影响，默认是1000ms
+        multiplier: 1 # 失败后下次的等待时长倍数，下次等待时长 = initial-interval * multiplier，默认是1
+        max-attempts: 3 # 最大重试次数，默认是3
+```
+
+在 `mq-demo` 项目中添加配置，docker暂时关闭RabbitMQ，然后通过测试类发送消息，观察控制台日志，可以看到发送者在连接失败后，进行了重试，最终还是失败了，这里的时间间隔为2s是因为连接超时的1s加上了发送重试间隔1s：
+
+```text
+09-23 15:12:06:879  INFO 464 --- [           main] o.s.a.r.c.CachingConnectionFactory       : Attempting to connect to: [192.168.*.*:5672]
+09-23 15:12:08:901  INFO 464 --- [           main] o.s.a.r.c.CachingConnectionFactory       : Attempting to connect to: [192.168.*.*:5672]
+09-23 15:12:10:921  INFO 464 --- [           main] o.s.a.r.c.CachingConnectionFactory       : Attempting to connect to: [192.168.*.*:5672]
+
+org.springframework.amqp.AmqpIOException: java.net.SocketTimeoutException: Connect timed out
+
+```
+
 ### 发送确认机制
+
+Spring AMQP提供了两种发送确认机制：
+
+1. **发布确认**（Publisher Confirms）：确保消息成功发送到交换机
+2. **发布回退**（Publisher Returns）：确保消息成功路由到队列
+
+开启确认机制之后，当发送者发送消息给MQ后，MQ会在内部判断消息的处理情况，如果被正确处理，那么就会返回确认结果给发送者，反之返回失败结果，具体来说有以下几种情况：
+
+1. 消息投递到了MQ，但是路由失败：MQ通过Publisher Return返回路由异常原因，并通过Publisher Confirm返回ACK，告知投递成功
+    - 这一般是因为路由管理员没有给交换机绑定对应的队列，导致交换机无法路由消息
+    - **此时做消息重发没有意义，因为路由信息本身就是错误的**
+2. 临时消息投递到了MQ，并且入队成功：返回ACK，告知投递成功
+    - 投递到的是非持久化队列，消息是保存在内存中的，MQ宕机后消息会丢失
+3. 持久消息投递到了MQ，并且入队成功**并完成持久化**：返回ACK，告知投递成功
+    - 投递到的是持久化队列，消息是保存在磁盘中的，直到消息进入到磁盘才会返回ACK
+4. 除了以上三种情况以外，其他任何情况都视为投递失败：返回NACK，告知投递失败
+    - 例如网络异常、MQ宕机等
+
+为了开启发送确认机制，需要在配置文件中添加如下配置：
+
+```yaml
+spring:
+  rabbitmq:
+    publisher-confirm-type: correlated # 开启publisher confirm机制，并设置confirm类型
+    publisher-returns: true # 开启publisher return机制
+```
+
+其中 `publisher-confirm-type` 属性有三个可选值：
+
+1. `none`：不开启发送确认机制，默认值
+2. `simple`：同步阻塞等待MQ的回执，等待期间后面的代码不会执行，**不常用**
+3. `correlated`：MQ异步回调返回回执，不影响后面代码的执行
+
+然后配置 `RabbitTemplate` 的回调函数，首先是返回回调，确认消息是否成功到达队列：
+
+```java
+
+@Slf4j
+@AllArgsConstructor
+@Configuration
+public class MqConfig {
+    // 每个RabbitTemplate实例只能设置一个回调函数
+    private final RabbitTemplate rabbitTemplate;
+
+    // 在类初始化后设置回调函数
+    @PostConstruct
+    public void init() {
+        rabbitTemplate.setReturnsCallback(new RabbitTemplate.ReturnsCallback() {
+            @Override
+            public void returnedMessage(ReturnedMessage returned) {
+                log.error("触发return callback,");
+                log.debug("exchange: {}", returned.getExchange());
+                log.debug("routingKey: {}", returned.getRoutingKey());
+                log.debug("message: {}", returned.getMessage());
+                log.debug("replyCode: {}", returned.getReplyCode());
+                log.debug("replyText: {}", returned.getReplyText());
+            }
+        });
+    }
+}
+```
+
+接着是确认回调，确认消息是否成功到达交换机。由于每次发消息时的逻辑不一定相同，因此ConfirmCallback需要在每次发消息时都定义，这就需要传进 `convertAndSend` 方法第四个参数 `CorrelationData`，用于携带当前消息的唯一标识ID和回调结果对象，它是一个 `SettableListenableFuture`，可以通过它来设置回调结果。
+
+```java
+
+@Test
+void testPublisherConfirm() {
+    // 1. 创建CorrelationData，指定一个唯一ID
+    // 该ID用于标识当前消息，方便在回调函数中根据ID来处理对应的消息
+    CorrelationData cd = new CorrelationData(UUID.randomUUID().toString());
+
+    // 2. 给Future添加ConfirmCallback
+    // 这是异步任务完成时的回调函数，只拿到Future是无法获取回执结果的，必须要手动添加回执逻辑
+    cd.getFuture().addCallback(
+            new ListenableFutureCallback<CorrelationData.Confirm>() {
+
+                // 内部处理Future发生异常时的处理逻辑
+                // 一般不会到这里，因为内部已经做了很多异常捕获
+                @Override
+                public void onFailure(Throwable ex) {
+                    // 2.1.Future发生异常时的处理逻辑，基本不会触发
+                    log.error("send message fail", ex);
+                }
+
+                // Future成功时的处理逻辑
+                // 需要根据返回的结果是否是ACK进行后续的逻辑处理
+                // 如果是ACK，记录日志即可
+                // 如果是NACK，说明消息发送失败，需要进行补偿处理，例如重试或者记录到数据库中
+                // 注意：这里的onSuccess方法是在另一个线程中执行的，不要在这里执行耗时的业务逻辑
+                @Override
+                public void onSuccess(CorrelationData.Confirm result) {
+                    // 2.2.Future接收到回执的处理逻辑，参数中的result就是回执内容
+                    if (result.isAck()) { // result.isAck()，boolean类型，true代表ack回执，false 代表 nack回执
+                        log.debug("发送消息成功，收到 ack!");
+                    } else { // result.getReason()，String类型，返回nack时的异常描述
+                        log.error("发送消息失败，收到 nack, reason : {}", result.getReason());
+                    }
+                }
+            });
+
+    // 3. 发送消息
+    // 传入四个参数：交换机、路由键、消息体、CorrelationData
+    rabbitTemplate.convertAndSend("hmall.direct", "q", "hello", cd);
+}
+```
+
+也可以通过创建实现 `ApplicationContextAware` 接口的类来实现确认回调：
+
+```java
+
+@Configuration
+@Slf4j
+@RequiredArgsConstructor
+public class MqConfig implements ApplicationContextAware {
+
+    private final RabbitTemplate rabbitTemplate;
+
+    @Override
+    public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
+        log.info("初始化 RabbitTemplate Callbacks");
+
+        rabbitTemplate.setReturnsCallback(returnedMessage -> {
+            log.error("触发了return callback");
+            log.debug("exchange: {}", returnedMessage.getExchange());
+            log.debug("routingKey: {}", returnedMessage.getRoutingKey());
+            log.debug("message: {}", returnedMessage.getMessage());
+            log.debug("replyCode: {}", returnedMessage.getReplyCode());
+            log.debug("replyText: {}", returnedMessage.getReplyText());
+        });
+
+        rabbitTemplate.setConfirmCallback((correlationData, ack, cause) -> {
+            if (ack) {
+                log.info("消息成功发送到交换机, 消息ID: {}", correlationData != null ? correlationData.getId() : "null");
+            } else {
+                log.error("消息发送到交换机失败, 消息ID: {}, 失败原因: {}", correlationData != null ? correlationData.getId() : "null", cause);
+            }
+        });
+    }
+}
+```
+
+如果在发送消息时还定义了其他确认回调函数，那么两个回调函数都会被调用。
 
 ## 可靠性 - 消息队列
 
+Spring AMQP创建的交换机、消息队列以及消息，**默认都是非持久化的**，也就是存储在内存中。只有当MQ内存满的时候，才会将部分**较早的**消息写入磁盘，称为**Page Out**，这个过程是阻塞式的，较为耗时，MQ在这个过程中无法处理其他请求，且当消费者故障或者处理过慢时，会导致严重的消息积压。
+
+总结来说，RabbitMQ会通过以下几种方式来保证消息的可靠性：
+
+- 持久化：首先**通过配置**可以使得交换机、队列和消息都变成持久化的，这样即使MQ宕机，重启后也能恢复数据
+- LazyQueue：RabbitMQ在3.6版本中引入了Lazy Queue的概念，**将所有消息直接持久化**，只有在消费者消费消息时，才会将消息从磁盘中读取到内存中进行处理。3.12后是队列的默认行为
+- 发送者回执：开启持久化和发送者确认机制时，只有**当消息被成功持久化后，才会返回ACK**给发送者
+
+> 持久化和惰性队列的区别是：持久化是接收到消息后先存入内存，然后异步写入磁盘；惰性队列是接收到消息后直接存入磁盘，不经过内存。
+
 ### 消息持久化
+
+消息持久化包括三个方面：交换机、队列和消息本身。
+
+在控制台中，交换机和队列在创建时选择 `Durable` 选项，消息在发送时设置 `Delivery Mode` 为 `Persistent`。这样就能实现消息的持久化。
+
+在未使用持久化时，当高并发时，内存空间被占满，RabbitMQ会采用被动持久化的策略，将部分较早的消息写入磁盘，此时会导致流量的突然降低，影响效率。主动设置持久化之后，消息直接写入磁盘，防止流量的突然降低，反而会提高效率。
 
 ### LazyQueue
 
+实际上，使用持久化后，由于数据需要在磁盘保存副本，整体的并发效率会有所下降，尤其是在高并发的场景下，磁盘I/O会成为瓶颈。
+
+> 为了提高高并发场景下的消息处理能力，RabbitMQ在3.6.0版本中引入了Lazy Queue（惰性队列）的概念，有如下特征：
+> - 接收到消息后直接存入磁盘，不再存储到内存，无需Page Out，从而避免了阻塞
+> - 消费者当要消费消息时才会从磁盘中读取，并加载到内存（可以提前缓存部分消息，最多2048条）
+> - 声明为惰性队列后，被声明为非持久化的消息也会被直接写入磁盘，而不是存储在内存中
+
+> 在3.12版本后，Lazy Queue成为了队列的默认行为，无法更改。
+
+在控制台中，创建队列时，添加参数 `x-queue-mode`，值为 `lazy` 即可，或者直接点击下方的 `Lazy mode` 选项，可以自动添加参数。
+
+使用代码声明时，需要使用 `QueueBuilder` 来创建队列：
+
+```java
+
+@Bean
+public Queue lazyQueue() {
+    return QueueBuilder
+            .durable("lazy.queue")
+            .lazy() // 设置为惰性队列，或者.withArgument("x-queue-mode", "lazy")
+            .build();
+}
+```
+
+使用 `@RabbitListener` 注解声明时，可以通过 `arguments` 属性来添加参数：
+
+```java
+
+@RabbitListener(queuesToDeclare = @Queue(
+        name = "lazy.queue",
+        durable = "true",
+        arguments = @Argument(name = "x-queue-mode", value = "lazy")  // 设置为惰性队列
+))
+public void listenLazyQueue(String msg) {
+    log.info("消费者接收到lazy.queue的消息: {}", msg);
+}
+```
+
 ## 可靠性 - 消费者
+
+消费者可靠性主要包括三个方面：
+
+1. 消费者确认机制：确保消息被成功接收
+2. 消息重试与补偿：确保消息被成功处理
+3. 幂等性设计：确保消息被重复处理时不会产生副作用
 
 ### 消费者确认机制
 
+类似发送者确认机制的MQ给发送者回执，消费者确认机制是当消费者处理消息成功后，给MQ发送一个回执。
+
+具体来说，交换机广播给消息队列消息后，消费者从队列中获取消息进行处理，此时队列先不移除消息，而是会将该消息标记为“未确认”（unacknowledged），消费者**处理消息产生结果后**，发送的回执有三种情况：
+
+1. ACK：如果消费者处理成功，那么就**发送一个ACK**给队列，队列就会将该消息移除
+2. NACK：如果消费者处理失败，那么就**发送一个NACK**给队列，队列就会将该消息重新发给消费者尝试再次处理
+3. REJECT：如果消费者处理失败，并且不想再处理该消息，那么就**发送一个REJECT**给队列，队列就会将该消息**丢弃或者进入死信交换机**。这种情况一般是因为**消息本身有问题**，处理失败也没有意义
+
+Spring AMQP已经实现了消息确认功能，并可以通过配置文件选择确认模式：
+
+1. NONE：不处理，消息投递给消费者后，立即返回ACK，消息立即从队列中移除，非常不安全，不推荐使用
+2. MANUAL：手动模式，手动在业务代码中调用API发送ACK或REJECT，有一定侵入性，但更灵活
+3. AUTO：自动模式，Spring AMQP通过AOP对消息处理逻辑做了环绕增强
+    - 业务正常执行，返回ACK
+    - 业务出现异常，返回NACK
+    - 消息处理或校验异常，返回REJECT（`MessageConversionException`、`AmqpRejectAndDontRequeueException` 等）
+
+在配置文件中添加如下配置，开启消费者确认机制：
+
+```yaml
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        acknowledge-mode: auto # 设置消费者确认模式，auto为自动模式，manual为手动模式，none为不处理，默认是auto
+```
+
+开启AUTO模式之后，RabbitMQ在消费者正式处理消息前，会**先将消息标记为“未确认”（Unacked）**，然后调用消费者的处理方法，根据处理结果来决定发送哪种回执，如前文所述。
+
 ### 消息重试与补偿
+
+在默认情况下，开启AUTO模式之后，消费者处理消息失败时，RabbitMQ会自动返回NACK，并且**立即重新投递该消息**，这种重试机制是**无限次的**，直到消费者处理成功为止。
+
+但是如果消费者长时间无法从故障中恢复，那么消费者一直返回NACK，MQ也会一直重新消息入队并重试，这会导致消息积压，影响其他消息的处理，甚至可能导致MQ内存被占满，最终宕机。
+
+Spring AMQP提供了消费者失败重试机制，在消费者出现异常时，使用**本地重试**，可以通过配置文件来设置重试的参数：
+
+```yaml
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        prefetch: 1 # 每次从队列中获取的消息数量，默认是1
+        retry:
+          enabled: true # 开启重试机制，默认false
+#          initial-interval: 1000ms # 失败后的初始等待时间，降低长时间网络波动的影响，默认是1000ms
+#          multiplier: 1 # 失败后下次的等待时长倍数，下次等待时长 = initial-interval * multiplier，默认是1
+#          max-attempts: 3 # 最大重试次数，默认是3
+#          stateless: true # 是否使用无状态重试，默认true，如果业务中包含事务，这里必须是false
+```
+
+在默认情况下（仅开启 `retry.enabled: true`），消费者消息重试机制在达到最大重试次数之后，抛出一个 `RejectAndDontRequeueRecoverer`，并进入 `ConditionalRejectingErrorHandler`，这样就会触发REJECT回执，消息会被丢弃或者进入死信交换机。默认策略下显然会降低消息的可靠性。
+
+消息重试失败后，需要 `MessageRecoverer` 来处理失败的消息，Spring AMQP提供了三种实现：
+
+1. `RejectAndDontRequeueRecoverer`：默认实现，发送REJECT回执，消息被丢弃，不推荐
+2. `ImmediateRequeueMessageRecoverer`：发送NACK回执，消息重新入队等待下次消费，比起消费者确认NACK机制**频率更低，较安全**
+3. `RepublishMessageRecoverer`：将失败的消息重新发布到指定交换机，适合做日志记录或警告通知
+
+考虑第三种实现，首先定义接受失败消息的交换机、队列以及绑定关系。然后定义一个 `RepublishMessageRecoverer` 的Bean，指定失败消息的交换机和路由键：
+
+```java
+
+@Configuration
+public class ErrorMessageConfiguration {
+    @Bean
+    public DirectExchange errorExchange() {
+        return new DirectExchange("error.direct", true, false);
+    }
+
+    @Bean
+    public Queue errorQueue() {
+        return new Queue("error.queue", true, false, false);
+    }
+
+    @Bean
+    public Binding errorQueueBinding(Queue errorQueue, DirectExchange errorExchange) {
+        return BindingBuilder.bind(errorQueue).to(errorExchange).with("error");
+    }
+
+    @Bean
+    public MessageRecoverer messageRecoverer(RabbitTemplate rabbitTemplate) {
+        return new RepublishMessageRecoverer(rabbitTemplate, "error.direct", "error");
+    }
+}
+```
+
+实现之后，消息经过本地重试之后，就会自动发送至 `error.direct` 交换机，路由键为 `error`，然后进入 `error.queue` 队列中，信息中的属性会包含异常信息，以及全部的异常堆栈，方便后续排查问题。
+
+```text
+spring 消费者接收到消息：【hello, spring amqp!】
+spring 消费者接收到消息：【hello, spring amqp!】
+spring 消费者接收到消息：【hello, spring amqp!】
+09-24 15:11:20:653  WARN 97712 --- [ntContainer#0-1] o.s.a.r.retry.RepublishMessageRecoverer : Republishing failed message to exchange 'error.direct' with routing key error
+```
 
 ### 幂等性设计
 
-## 延迟消息
+在分布式系统中，消息的重复投递是不可避免的，例如网络抖动、消费者宕机等，都会导致消息被重复消费，**多为消费者回执没有正常被MQ接收的情形**。如果消费者处理消息的逻辑不是幂等的，那么就会产生副作用，影响系统的一致性。业务的幂等性就是指同一操作执行多次，产生的结果与执行一次的结果相同。
+
+一般来说，GET和DELETE请求是幂等的，而POST和PUT请求不是幂等的。对于非幂等的操作，可以通过以下几种方式来实现幂等性：
+
+1. **唯一请求ID**：利用ID区分是否是重复消息
+    - 每一条消息都生成一个唯一的ID（如UUID），与消息一起投递给消费者
+    - 消费者接收到消息后处理业务，业务处理成功后将ID存入数据库
+    - 下次接收到相同ID的消息时，去数据库查询是否已存在，存在则视为重复消息，放弃处理
+    - **额外的存储空间、影响性能、业务复杂度增加、侵入性增加、判断逻辑与主要业务不相关**
+2. **状态检查**：**结合业务本身逻辑**，利用业务状态区分是否是重复消息（推荐，但不一定对所有业务有效）
+    - 例如余额支付业务中，最终MQ通知交易服务修改订单状态为已支付
+    - 第一次消息推送，交易服务没有收到消息，打回队列重试
+    - 此时用户通过交易服务取消订单，订单状态改为已取消
+    - 这个时候网络恢复，MQ重试，交易服务接收到，那么此时就不应该修改状态订单为已支付
+    - 通过业务逻辑，既然发现**订单状态不再是未支付，那么就不应该再处理该消息**
+    - 这种情况下使用的是**业务本身的状态**来区分是否是重复消息，也**不用额外增加存储空间**
+
+唯一请求ID法需要为消息转换器添加ID属性，Jackson2JsonMessageConverter默认是不创建消息ID的，因此需要手动设置：
+
+```java
+
+@Bean
+public MessageConverter messageConverter() {
+    Jackson2JsonMessageConverter jjmc = new Jackson2JsonMessageConverter();
+    jjmc.setCreateMessageIds(true);
+    return jjmc;
+}
+```
+
+先关闭消费者，然后发送一条消息，在控制台中可见消息的属性中包含 `message_id`，这样消费者就可以根据这个ID进行进一步处理，此时需要使用 `Message` 对象来接收消息：
+
+```java
+
+@RabbitListener(queues = "simple.queue")
+public void listenSimpleQueueMessage(Message msg) throws InterruptedException {
+    System.out.println("msg的ID=" + msg.getMessageProperties().getMessageId());
+    System.out.println("spring 消费者接收到消息：" + msg);
+}
+```
+
+状态检查法需要修改 `trade-service` 模块中的 `PayStatusListener.listenPaySuccess` 方法：
+
+```java
+public void listenPaySuccess(Long orderId) {
+    log.info("接收到支付成功的消息，订单ID：{}", orderId);
+    orderService.listenPaySuccess(orderId);
+}
+```
+
+然后将业务逻辑封装进 `OrderServiceImpl.listenPaySuccess` 方法中：
+
+```java
+
+@Override
+public void listenPaySuccess(Long orderId) {
+    // 1. 首先查询订单
+    Order order = getById(orderId);
+
+    // 2. 判断订单状态是否是未支付
+    if (order == null || order.getStatus() != 1) {
+        return;
+    }
+
+    // 3. 标记订单状态为已支付
+    markOrderPaySuccess(orderId);
+}
+```
+
+## 延迟消息 - 兜底方案
 
 ### 基本概念
 

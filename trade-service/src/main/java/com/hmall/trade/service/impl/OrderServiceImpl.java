@@ -108,6 +108,20 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         updateById(order);
     }
 
+    @Override
+    public void listenPaySuccess(Long orderId) {
+        // 1. 首先查询订单
+        Order order = getById(orderId);
+
+        // 2. 判断订单状态是否是未支付
+        if (order == null || order.getStatus() != 1) {
+            return;
+        }
+
+        // 3. 标记订单状态为已支付
+        markOrderPaySuccess(orderId);
+    }
+
     private List<OrderDetail> buildDetails(Long orderId, List<ItemDTO> items, Map<Long, Integer> numMap) {
         List<OrderDetail> details = new ArrayList<>(items.size());
         for (ItemDTO item : items) {
