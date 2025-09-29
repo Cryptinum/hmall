@@ -4,6 +4,19 @@
 
 项目文档：https://b11et3un53m.feishu.cn/wiki/FYNkwb1i6i0qwCk7lF2caEq5nRe
 
+## 常用访问端口
+
+| 服务名称          | 端口号   | 说明                |
+|---------------|-------|-------------------|
+| MySQL         | 3306  | 数据库服务             |
+| Nacos         | 8848  | 服务注册与配置中心         |
+| Redis         | 6379  | 缓存服务              |
+| RabbitMQ      | 5672  | 消息队列服务            |
+| RabbitMQ管理界面  | 15672 | 消息队列管理界面          |
+| Elasticsearch | 9200  | 搜索引擎服务            |
+| Kibana        | 5601  | Elasticsearch管理界面 |
+| 网关服务          | 8080  | 统一网关入口            |
+
 # Day 1 - Mybatis Plus
 
 见本地项目 `mybatisplus` ，此处省略。
@@ -2635,3 +2648,533 @@ public void cancelOrder(Long orderId) {
 ```
 
 其他业务逻辑主要涉及到Feign的远程调用，略。
+
+# Day 8 - 搜索引擎 上 - Elasticsearch基础
+
+Lucene是一个Java编写的高性能、可扩展的信息检索库，提供了强大的全文检索和分析功能。它是一个底层类库，提供了索引和搜索的核心功能，但并不包含分布式和网络功能。Lucene基于倒排索引（Inverted Index）数据结构，高性能、易扩展。它支持多种查询类型，如布尔查询、短语查询、范围查询等，并且提供了丰富的分析器（Analyzer）来处理文本数据的分词和过滤。
+
+Elasticsearch是一个基于Lucene构建的分布式搜索引擎，**使用JSON存储**，提供了全文检索、结构化搜索、分析等功能，广泛应用于日志分析、实时监控、全文搜索等场景。ES**支持分布式**架构，能够**水平扩展**以处理大规模数据。它**提供了RESTful API**，支持多种编程语言的客户端库，方便开发者集成和使用。
+
+ES内部结合了kibana、Logstash、Beats等组件，形成了Elastic Stack（ELK Stack），用于数据采集、日志分析、实时监控、可视化等场景。ES作为核心组件，负责存储、计算和搜索数据；Logstash和Beats用于数据采集和传输；Kibana用于数据可视化和分析。
+
+## 安装部署
+
+安装ES的基础上，还需安装kibana用于数据可视化、请求发送等。
+
+使用如下docker命令安装ES：
+
+```bash
+docker run -d \
+    --name es \
+    # 设置最大内存和最小内存为512MB
+    -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+    # 设置为单节点模式，默认是集群模式  
+    -e "discovery.type=single-node" \
+    # 挂载数据和插件目录
+    -v es-plugins:/usr/share/elasticsearch/plugins \
+    -v es-data:/usr/share/elasticsearch/data \
+    -v es-logs:/usr/share/elasticsearch/logs \
+    --privileged \
+    --network hm-net \
+    # 映射端口9200用于HTTP请求，9300用于节点间通信
+    -p 9200:9200 \
+    -p 9300:9300 \
+    elasticsearch:7.12.1
+```
+
+使用如下docker命令安装kibana：
+
+```bash
+docker run -d \
+    --name kibana \
+    -e ELASTICSEARCH_HOSTS=http://es:9200 \
+    --network=hm-net \
+    -p 5601:5601  \
+    kibana:7.12.1
+```
+
+分别通过9200和5601端口即可访问ES和kibana。
+
+## 基本概念
+
+### 正向和倒排索引
+
+数据库中，每条数据就是一个文档（Document），文档由多个字段（Field）组成，每个字段包含具体的值。文档按照语义分成的词语称为词条（Term），词条是索引的基本单位。
+
+传统数据库如MySQL使用的是**正向索引**（Forward Index），即从文档到关键词的映射关系，**使用主键搜索关键词**。每个文档都有一个唯一的ID，数据库通过ID来查找文档，然后从文档中提取关键词进行搜索。MySQL默认的引擎是InnoDB，**InnoDB使用B+树**作为索引结构，适合范围查询和排序操作，但不适合全文搜索。使用MySQL的 `LIKE` 语句进行模糊查询时，通常会导致**全表扫描**，效率较低。
+
+由于B+树的键是按字典顺序排列的，因此使用前缀匹配时可以使用索引，但是中缀和后缀匹配时，就会导致索引失效。
+
+> MySQL内部提供了全文索引，当在一个 `TEXT` 或 `VARCHAR` 字段上创建全文索引时，MySQL会自动为该字段创建一个倒排索引，从而提高全文搜索的效率。但是MySQL的全文索引功能相对较弱，支持的查询类型有限，且不支持分布式和水平扩展。
+
+ES不仅支持正向索引，还支持**倒排索引**（Inverted Index），即从关键词到文档的映射关系，**使用关键词搜索文档ID**。倒排索引将文档中的每个关键词作为索引项，并记录包含该关键词的文档ID列表。用关键词进行索引需要使用分词器（Analyzer）对文本进行分词，将文本拆分成一个个独立的词元（Token），也就是关键词。
+
+这样，当用户输入搜索内容时，ES首先使用分词器对搜索内容进行分词，这样就能快速找到包含该关键词的所有文档，而不需要扫描整个数据库。根据业务需求，ES可以将找到的文档ID进行排序、过滤、交并集等操作，最终返回给用户。针对错别字等问题，ES还提供了模糊查询、同义词查询等功能，使用编辑距离（Levenshtein Distance）来衡量两个词语的相似度。
+
+> 用来比喻的话，正向索引就是书最开始的目录，通过页码找到内容；倒排索引是书最后的关键词索引，通过关键词找到页码。
+
+### InnoDB的索引方式
+
+InnoDB中，索引分为两种，**聚簇索引**（Clustered Index）和**二级索引**（Secondary Index）。
+
+**聚簇索引**中，数据本身就是索引，B+树的叶子节点直接存储完整的行数据，因此通过聚簇索引查找数据时，只需要一次I/O操作即可获取完整的行数据。每个表只能有一个聚簇索引，通常是主键索引。
+
+**二级索引**是，除了聚簇索引之外的其他索引，B+树的叶子节点存储的是 `索引列的值 + 聚簇索引的主键值`。
+
+**回表问题**是，当使用一个二级索引进行查询，并且 `SELECT` 语句中需要返回的列不完全包含在该二级索引中时，就会发生回表操作。数据库先通过二级索引的B+树找到满足条件的条目，并从其叶子节点获取到主键ID。然后再拿着这个主键ID，去聚簇索引的B+树中查找，最终定位到完整的行数据，并取出需要的其他列。这样，一次查询就需要两次I/O操作，效率较低。
+
+**索引失效**是，指明明在某列上建立了索引，但执行查询时，数据库的查询优化器判断使用该索引的成本更高（或者根本无法使用），最终选择放弃索引，退化为全表扫描。常见的场景有：
+
+- 对索引列**使用函数**，如 `WHERE YEAR(create_time) = 2025`。
+- 使用 `LIKE '%keyword'` 进行**模糊查询**。
+- `OR` 连接的条件中，**有一方没有索引**。
+- 索引列存在**隐式类型转换**，如索引列是 `VARCHAR`，查询条件却是 `WHERE phone_number = 188...`（数字）。
+- 查询优化器估算全表扫描比走索引更快（例如表数据量很小，或者查询结果占了全表的大部分）。
+
+**覆盖索引**是，一种解决回表问题的优化手段。当查询的字段全部包含在某个二级索引中时，数据库可以直接从该二级索引的叶子节点获取到所有需要的列，而不需要回到聚簇索引中查找完整的行数据。这样，一次查询就只需要一次I/O操作，效率更高。
+
+### IK分词器
+
+IK分词器是一个基于Java的中文分词工具包，集成在ES中。目前的维护者：https://github.com/infinilabs/analysis-ik
+
+IK分词器采用的核心算法是**基于词典的正向最大匹配算法**，并结合了智能的歧义消除逻辑。IK 分词器会将所有的核心词汇和用户自定义词汇加载到内存中，构建成一棵**字典树**（Trie Tree）。这种数据结构能够极快地完成词语的查找和前缀匹配，是其高性能的基础。
+
+IK分词器又两种分词模式，**细粒度切分**（`ik_max_word`）和**智能切分**（`ik_smart`）：
+
+1. 细粒度切分（`ik_max_word`）：将文本尽可能地切分成更多的词语，适合需要高召回率的场景，例如搜索引擎。优点是覆盖面广，缺点是可能会产生较多的噪音词。
+2. 智能切分（`ik_smart`）：采用更智能的算法，结合上下文和词频信息，进行更合理的切分，适合需要高准确率的场景，例如文本分析。优点是结果更符合语义，缺点是可能会漏掉一些词语。
+
+通过 `docker volume inspect es-plugins` 查看ES插件目录，然后将下载的压缩包解压到该目录下，重启ES即可。
+
+可以在kibana的Dev Tools中执行以下命令，查看IK分词器是否安装成功并使用IK分词器
+
+```html
+GET _cat/plugins
+
+POST /_analyze
+{
+"analyzer": "ik_smart",  // 或者 `ik_max_word`
+"text": "刘德华为什么很少演反派"
+}
+```
+
+对于需要进行词典扩展的场景，可以在插件目录下的 `config` 目录中，创建 `custom.dic` 文件，添加自定义的词条，每行一个词条，然后在 `IKAnalysis.cfg.xml` 文件中，将字典添加到配置属性 `ext_dict` 中，可以配置扩展字典、停止词字典，以及它们的远程版本，用路径或者URL，**远程词典更新支持热更新**，IK会启动一个后台线程定期检查。
+
+### ES的存储形式
+
+ES使用**JSON格式**存储数据，每个JSON对象称为一个**文档**（Document），文档由多个**字段**（Field）组成。相同类型的文档存储在**索引**（Index）中，索引类似于数据库中的**表**（Table），例如商品索引、用户索引、订单索引等。每个索引可以包含多个文档，文档通过唯一的ID进行标识。为了区分MySQL中的索引，也可以将ES中的索引称为**索引库**。索引库会约束文档的结构和字段类型，称为**映射**（Mapping），类似于数据库中的**模式**（Schema）。
+
+| MySQL  | ES       | 说明                                 |
+|--------|----------|------------------------------------|
+| Table  | Index    | 索引就是文档的集合，类似于数据库中的表                |
+| Row    | Document | 文档就是一条条的数据，类似于数据库中的行，文档都是JSON格式    |
+| Column | Field    | 字段就是文档中的属性，类似于数据库中的列               |
+| Schema | Mapping  | 映射就是索引的结构定义，约束字段及类型，类似于数据库中的表结构    |
+| SQL    | DSL      | DSL是ES提供的JSON风格的查询语言，类似于数据库中的SQL语句 |
+
+## 基本语法
+
+### 索引库属性
+
+Mapping有多个属性：
+
+| 属性         | 说明                                                                  |
+|------------|---------------------------------------------------------------------|
+| type       | 字段类型，如text（可分词文本）、keyword（精确值文本）、date（ES自动序列化）、boolean、long、object等 |
+| index      | 是否索引该字段，默认true，设置为false后，该字段不能被搜索，但可以作为返回结果的一部分                     |
+| analyzer   | 分词器，指定该字段使用的分词器，如ik_smart、ik_max_word等                              |
+| properties | 嵌套对象，定义子字段的映射                                                       |
+
+在定义时，需要根据业务场景，合理选择字段类型和分词器，避免不必要的索引和分词操作，提高查询效率，例如如下文档：
+
+```json
+{
+  "age": 21,
+  "weight": 52.1,
+  "isMarried": false,
+  "info": "三国武将",
+  "email": "zy@sanguo.cn",
+  "score": [
+    99.1,
+    99.5,
+    98.9
+  ],
+  "name": {
+    "firstName": "云",
+    "lastName": "赵"
+  }
+}
+```
+
+在定义索引库时，各个字段的属性可以如下：
+
+|     字段名     |   字段类型    | 类型说明  | 是否参与搜索 | 是否参与分词 |    分词器     |
+|:-----------:|:---------:|:-----:|:------:|:------:|:----------:|
+|    `age`    | `integer` |  整数   |   √    |   ×    |     /      |
+|  `weight`   |  `float`  |  浮点数  |   √    |   ×    |     /      |
+| `isMarried` | `boolean` |  布尔值  |   √    |   ×    |     /      |
+|   `info`    |  `text`   | 可分词文本 |   √    |   √    | `ik_smart` |
+|   `email`   | `keyword` | 精确值文本 |   ×    |   ×    |     /      |
+|   `score`   |  `float`  | 浮点数组  |   √    |   ×    |     /      |
+|   `name`    | `object`  | 嵌套对象  |   √    |   ×    |     /      |
+| `firstName` | `keyword` | 精确值文本 |   √    |   ×    |     /      |
+| `lastName`  | `keyword` | 精确值文本 |   √    |   ×    |     /      |
+
+> 注意：当对数组进行排序时，如果是降序（值越大越靠前），那么数组中最大的值会被用来排序；如果是升序（值越小越靠前），那么数组中最小的值会被用来排序。简单来说，就是尽量让排序更有优势的一面被用来排序。
+
+### 索引库CRUD
+
+| 操作类型   | HTTP方法 | URL格式            | 说明                               |
+|--------|--------|------------------|----------------------------------|
+| 创建索引库  | PUT    | `/索引库名`          | 创建一个新的索引库                        |
+| 删除索引库  | DELETE | `/索引库名`          | 删除一个已有的索引库                       |
+| 添加映射字段 | PUT    | `/索引库名/_mapping` | 修改索引库的映射，注意**只能添加新的字段，不能修改已有字段** |
+| 查看索引库  | GET    | `/索引库名`          | 查看一个已有的索引库                       |
+
+```elasticsearch
+# 创建索引库
+PUT /索引库名称
+{
+  "mappings": {
+    "properties": {
+      "字段名":{
+        "type": "text",
+        "analyzer": "ik_smart"
+      },
+      "字段名2":{
+        "type": "keyword",
+        "index": "false"
+      },
+      "字段名3":{
+        "properties": {
+          "子字段": {
+            "type": "keyword"
+          }
+        }
+      },
+      // ...略
+    }
+  }
+}
+```
+
+```elasticsearch
+# 修改索引库，新增映射
+PUT /索引库名/_mapping
+{
+  "properties": {
+    "新字段名":{
+      "type": "integer"
+    }
+  }
+}
+```
+
+### 文档CRUD
+
+| 操作类型   | HTTP方法   | URL格式                | 说明                                      |
+|--------|----------|----------------------|-----------------------------------------|
+| 创建文档   | PUT/POST | `/索引库名/_doc/{id}`    | 创建一个新的文档，`id`可选，不指定则自动生成                |
+| 删除文档   | DELETE   | `/索引库名/_doc/{id}`    | 删除一个已有的文档，`id`必选                        |
+| 全量修改文档 | POST/PUT | `/索引库名/_doc/{id}`    | 修改一个已有的文档，`id`必选，**先删后增，会覆盖原有文档，字段不要缺** |
+| 局部修改文档 | POST     | `/索引库名/_update/{id}` | 修改一个已有的文档，`id`必选，**只修改指定字段，不会覆盖原有文档**   |
+| 查看文档   | GET      | `/索引库名/_doc/{id}`    | 查看一个已有的文档，`id`必选                        |
+
+```elasticsearch
+POST /索引库名/_doc/{id}
+{
+    "字段1": "值1",
+    "字段2": "值2",
+    "字段3": {
+        "子属性1": "值3",
+        "子属性2": "值4"
+    },
+}
+```
+
+### 批处理
+
+批处理采用POST请求，使用的路径是 `/_bulk`，请求体中包含多条操作指令和数据，每条指令和数据占一行，指令和数据之间用换行符分隔。每条指令是一个JSON对象，指定操作类型（如 `index`、`delete`、`update`）和目标文档的索引库名、文档类型（固定为 `_doc`）、文档ID等信息。对于 `index` 和 `update` 操作，紧接着指令行后面还需要一行数据行，包含要添加或修改的文档内容。
+
+其中 `index` 操作用于添加或更新文档，如果指定的ID已存在，则会覆盖原有文档；`delete` 操作用于删除文档；`create` 操作用于添加文档，如果指定的ID已存在，则会报错；`update` 操作用于局部修改文档，只修改指定字段，不会覆盖原有文档。
+
+```elasticsearch
+POST _bulk
+
+{ "index": { "_index": "test", "_id": "1" } }
+{ "field1": "value1" }
+
+{ "delete": { "_index": "test", "_id": "2" } }
+
+{ "create": { "_index": "test", "_id": "3" } }
+{ "field1": "value3" }
+
+{ "update": {"_id": "1", "_index": "test"} }
+{ "doc": {"field2": "value2"} }
+```
+
+## Java客户端 - RestClient
+
+官方网站：https://www.elastic.co/docs/reference/elasticsearch/clients/java
+
+目前的最新版本是9。
+
+IDEA有一个插件 `Elasticsearch Query - EDQL`，可以在IDEA中直接执行ES的DSL语句。
+
+### 准备工作
+
+首先引入依赖并在父工程中覆盖版本号：
+
+```xml
+
+<properties>
+    <elasticsearch.version>7.12.1</elasticsearch.version>
+</properties>
+<dependencies>
+<dependency>
+    <groupId>org.elasticsearch.client</groupId>
+    <artifactId>elasticsearch-rest-high-level-client</artifactId>
+</dependency>
+</dependencies>
+```
+
+然后新建一个测试类，在测试类中创建ES客户端：
+
+```java
+public class ElasticTest {
+    private RestHighLevelClient client;
+
+    // 创建ES客户端
+    @BeforeEach
+    void setUp() {
+        client = new RestHighLevelClient(RestClient.builder(
+                HttpHost.create("http://192.168.*.*:9200")  // 这里填写ES的地址
+        ));
+    }
+
+    // 销毁ES客户端
+    @AfterEach
+    void tearDown() throws IOException {
+        if (client != null) {
+            client.close();
+        }
+    }
+}
+```
+
+### 创建索引
+
+> 总结：核心是 `client.indices()` 方法来获取索引库的操作对象。
+> 基本步骤：
+> - 初始化一个 `RestHighLevelClient`，并添加创建和销毁方法，见上一节
+> - 创建 `XxxIndexRequest` 请求对象，其中 `Xxx` 可以是 `Create`、`Delete`、`Get`
+> - 准备请求参数（`CreateIndexRequest` 需要传入映射参数）
+> - 发送请求，调用 `client.indices().xxx(request, RequestOptions.DEFAULT)` 方法，其中 `xxx` 可以是 `create`、`delete`、`exists`
+
+MySQL商品数据库中包含以下字段，与索引库无关的字段已经划掉：
+
+| #  | 名称              | 数据类型     | 注释                    | 长度/集合 |
+|----|-----------------|----------|-----------------------|-------|
+| 1  | id              | BIGINT   | 商品id                  | 19    |
+| 2  | name            | VARCHAR  | SKU名称                 | 200   |
+| 3  | price           | INT      | 价格 (分)                | 10    |
+| 4  | ~~stock~~       | INT      | 库存数量                  | 10    |
+| 5  | image           | VARCHAR  | 商品图片                  | 200   |
+| 6  | category        | VARCHAR  | 类目名称                  | 200   |
+| 7  | brand           | VARCHAR  | 品牌名称                  | 100   |
+| 8  | ~~spec~~        | VARCHAR  | 规格                    | 200   |
+| 9  | sold            | INT      | 销量                    | 10    |
+| 10 | comment_count   | INT      | 评论数                   | 10    |
+| 11 | isAD            | TINYINT  | 是否是推广广告, true/false   | 1     |
+| 12 | ~~status~~      | INT      | 商品状态 1-正常, 2-下架, 3-删除 | 10    |
+| 13 | ~~create_time~~ | DATETIME | 创建时间                  |       |
+| 14 | update_time     | DATETIME | 更新时间                  |       |
+| 15 | ~~creator~~     | BIGINT   | 创建人                   | 19    |
+| 16 | ~~updater~~     | BIGINT   | 修改人                   | 19    |
+
+首先需要根据商品的业务场景，设计索引库的结构和字段类型，例如商品索引库可以包含以下字段，其中包含了前端可以用来搜索的字段、可以排序的字段、以及展示到前端的字段：
+
+| 字段名            | 字段类型      | 类型说明        | 是否参与搜索 | 是否参与分词 | 分词器 |
+|----------------|-----------|-------------|:------:|:------:|:---:|
+| `id`           | `keyword` | 长整数         |   √    |   ×    |  /  |
+| `name`         | `text`    | 字符串，参与分词搜索  |   √    |   √    | IK  |
+| `price`        | `integer` | 以分为单位，所以是整数 |   √    |   ×    |  /  |
+| `image`        | `keyword` | 字符串，但是不分词   |   ×    |   ×    |  /  |
+| `category`     | `keyword` | 字符串，但是不分词   |   √    |   ×    |  /  |
+| `brand`        | `keyword` | 字符串，但是不分词   |   √    |   ×    |  /  |
+| `sold`         | `integer` | 销量，整数       |   √    |   ×    |  /  |
+| `commentCount` | `integer` | 评价，整数       |   ×    |   ×    |  /  |
+| `isAD`         | `boolean` | 布尔类型        |   √    |   ×    |  /  |
+| `updateTime`   | `Date`    | 更新时间        |   √    |   ×    |  /  |
+
+> 注意：一般来说ID是用 `keyword` 类型存储的。ES的 `keyword` 类型，实际上是一个不可分词的字符串类型，适合存储精确值，例如ID、标签、分类等。`text` 类型是可分词的字符串类型，适合存储需要全文搜索的文本内容，例如商品名称、描述等。
+
+在Java中，使用 `CreateIndexRequest` 创建索引库：
+
+```java
+
+@Test
+void testCreateIndex() throws IOException {
+    // 1.创建Request对象
+    CreateIndexRequest request = new CreateIndexRequest("indexName");
+    // 2.准备请求参数
+    request.source(MAPPING_TEMPLATE, XContentType.JSON);
+    // 3.发送请求
+    client.indices().create(request, RequestOptions.DEFAULT);
+}
+```
+
+使用 `DeleteIndexRequest` 删除索引库：
+
+```java
+
+@Test
+void testDeleteIndex() throws IOException {
+    // 1.创建Request对象
+    DeleteIndexRequest request = new DeleteIndexRequest("indexName");
+    // 2.发送请求
+    client.indices().delete(request, RequestOptions.DEFAULT);
+}
+```
+
+使用 `GetIndexRequest` 查看索引库：
+
+```java
+
+@Test
+void testGetIndex() throws IOException {
+    // 1.创建Request对象
+    GetIndexRequest request = new GetIndexRequest("indexName");
+    // 2.发送请求
+    boolean exists = client.indices().exists(request, RequestOptions.DEFAULT);
+    System.out.println("索引库是否存在：" + exists);
+}
+```
+
+### 文档操作
+
+> 总结：基本步骤：
+> - 初始化一个 `RestHighLevelClient`，并添加创建和销毁方法，见上面一节
+> - 创建 `XxxRequest` 请求对象，其中 `Xxx` 可以是 `Index`、`Get`、`Delete`、`Update`
+> - 准备请求参数（`IndexRequest` 需要传入文档内容，`UpdateRequest` 需要传入修改内容）
+> - 发送请求，调用 `client.xxx(request, RequestOptions.DEFAULT)` 方法，其中 `xxx` 可以是 `index`、`get`、`delete`、`update`
+> - 获取并解析响应结果（`GetResponse` 需要将JSON字符串转换为对象）
+
+首先根据上面的索引库结构，创建一个商品的Java实体类，见 `ItemDoc`。
+
+然后通过 `IndexRequest` 进行文档操作，首先需要从MySQL中查询商品数据，然后将数据转换为 `ItemDoc` 对象，最后将对象转换为JSON字符串，发送到ES中：
+
+```java
+
+@Test
+void testAddDocument() throws IOException {
+    // 1.根据id查询商品数据
+    Item item = itemService.getById(100002644680L);
+    // 2.转换为文档类型
+    ItemDoc itemDoc = BeanUtil.copyProperties(item, ItemDoc.class);
+    // 3.将ItemDTO转json
+    String doc = JSONUtil.toJsonStr(itemDoc);
+
+    // 1.准备Request对象
+    IndexRequest request = new IndexRequest("items").id(itemDoc.getId());
+    // 2.准备Json文档
+    request.source(doc, XContentType.JSON);
+    // 3.发送请求
+    client.index(request, RequestOptions.DEFAULT);
+}
+```
+
+获取对象类似：
+
+```java
+
+@Test
+void testGetDocumentById() throws IOException {
+    // 1.准备Request对象
+    GetRequest request = new GetRequest("items").id("100002644680");
+    // 2.发送请求
+    GetResponse response = client.get(request, RequestOptions.DEFAULT);
+    // 3.获取响应结果中的source
+    String json = response.getSourceAsString();
+
+    // 4.解析json为对象
+    ItemDoc itemDoc = JSONUtil.toBean(json, ItemDoc.class);
+    System.out.println("itemDoc= " + ItemDoc);
+}
+```
+
+删除文档：
+
+```java
+
+@Test
+void testDeleteDocument() throws IOException {
+    // 1.准备Request，两个参数，第一个是索引库名，第二个是文档id
+    DeleteRequest request = new DeleteRequest("item", "100002644680");
+    // 2.发送请求
+    client.delete(request, RequestOptions.DEFAULT);
+}
+```
+
+全量修改与新增文档的API完全一致，局部修改使用 `UpdateRequest`：
+
+```java
+
+@Test
+void testUpdateDocument() throws IOException {
+    // 1.准备Request
+    UpdateRequest request = new UpdateRequest("items", "100002644680");
+    // 2.准备请求参数，也可以传入一个Map
+    request.doc(
+            "price", 58800,
+            "commentCount", 1
+    );
+    // 3.发送请求
+    client.update(request, RequestOptions.DEFAULT);
+}
+```
+
+### 批量操作
+
+批量操作使用 `BulkRequest`，然后通过 `add` 方法添加多个操作请求，实际上就是将多个 `IndexRequest`、`DeleteRequest`、`UpdateRequest` 组合在一起，最后发送请求。
+
+由于商品数据量较大，通常需要分页查询MySQL中的商品数据，然后批量导入到ES中：
+
+```java
+
+@Test
+void testLoadItemDocs() throws IOException {
+    // 分页查询商品数据
+    int pageNo = 1;
+    int size = 1000;
+    while (true) {
+        Page<Item> page = itemService.lambdaQuery().eq(Item::getStatus, 1).page(new Page<Item>(pageNo, size));
+        // 非空校验
+        List<Item> items = page.getRecords();
+        if (CollUtils.isEmpty(items)) {
+            return;
+        }
+        log.info("加载第{}页数据，共{}条", pageNo, items.size());
+        // 1.创建Request
+        BulkRequest request = new BulkRequest("items");
+        // 2.准备参数，添加多个新增的Request
+        for (Item item : items) {
+            // 2.1.转换为文档类型ItemDTO
+            ItemDoc itemDoc = BeanUtil.copyProperties(item, ItemDoc.class);
+            // 2.2.创建新增文档的Request对象
+            request.add(new IndexRequest()
+                    .id(itemDoc.getId())
+                    .source(JSONUtil.toJsonStr(itemDoc), XContentType.JSON));
+        }
+        // 3.发送请求
+        client.bulk(request, RequestOptions.DEFAULT);
+
+        // 翻页
+        pageNo++;
+    }
+}
+```
+
+## 业务改造
+
+# Day 9 - 搜索引擎 下 - Elasticsearch进阶
